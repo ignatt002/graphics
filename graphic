@@ -1,0 +1,1869 @@
+/**
+ * FiveCore Graph Engine (Core)
+ * ----------------------------
+ * Этот движок принимает ИСКЛЮЧИТЕЛЬНО команды на внутреннем английском API.
+ * За трансляцию с русского языка отвечает отдельный модуль: graph-translator.js
+ *
+ * ДОКУМЕНТАЦИЯ API:
+ * window.FiveCoreGraph = {
+ *   taskHasGraph(task),           // Проверяет наличие ключей 'graph*'
+ *   extractGraphBlocks(task),     // Возвращает массив команд по порядку ключей
+ *   render(container, commands),  // Отрисовывает SVG график в переданный элемент
+ *   createGraphElement(commands)  // Создаёт div.graph-box, внутри рендерит график и возвращает его
+ * }
+ * 
+ * ПОДДЕРЖИВАЕМЫЕ EN-КОМАНДЫ ДВИЖКА (ВНУТРЕННИЙ API):
+ * - axis_x: true/false
+ * - axis_y: true/false
+ * - grid: true/false
+ * - point NAME: X;Y
+ * - point_extra NAME: X;Y
+ * - main_line: true
+ * - line_extra NAME
+ * - angle_inner NAME: VAL
+ * - angle_outer NAME: VAL
+ * - segment NAME: VAL
+ * - circle: true / invisible
+ * - circle_center: NAME
+ * - circle_point DEG: NAME/true
+ * - radius DEG: NAME/true/?
+ * - diameter DEG: NAME/true
+ * - diameter_infinite: true
+ * - chord DEG1: DEG2
+ * - circle_inscribed: true
+ * - circle_circumscribed: true
+ */
+
+(function (global) {
+  const THEME = {
+    accent: '#1CB0F6',
+    grid: '#e5e5e5',
+    axis: '#a0a0a0',
+    axisText: '#888888',
+    text: '#4b4b4b',
+    point: '#1CB0F6',
+    bg: '#ffffff'
+  };
+
+  // Утилита для расчетов (точка 0 сверху, далее по часовой стрелке)
+  function getCirclePointMath(cx, cy, r, deg) {
+    const rad = (90 - deg) * (Math.PI / 180);
+    return {
+      x: cx + r * Math.cos(rad),
+      y: cy + r * Math.sin(rad)
+    };
+  }
+
+  const FiveCoreGraph = {
+    // ------------------------------------------------------------------------
+    // PUBLIC API
+    // ------------------------------------------------------------------------
+
+    taskHasGraph: function(task) {
+      if (!task || typeof task !== 'object') return false;
+      return Object.keys(task).some(key => key.toLowerCase().startsWith('graph'));
+    },
+
+    extractGraphBlocks: function(task) {
+      if (!task || typeof task !== 'object') return [];
+      return Object.keys(task)
+        .filter(k => k.toLowerCase().startsWith('graph'))
+        .sort((a, b) => {
+          const numA = parseInt(a.replace(/\D/g, '')) || 0;
+          const numB = parseInt(b.replace(/\D/g, '')) || 0;
+          return numA - numB;
+        })
+        .map(k => task[k]);
+    },
+
+    createGraphElement: function(commandsStr) {
+      const container = document.createElement('div');
+      container.className = 'graph-box';
+      container.style.width = '100%';
+      container.style.aspectRatio = '1 / 1';
+      container.style.position = 'relative';
+      container.style.backgroundColor = THEME.bg;
+      container.style.borderRadius = '20px';
+      container.style.border = `2px solid ${THEME.grid}`;
+      container.style.overflow = 'hidden';
+      
+      this.render(container, commandsStr);
+      return container;
+    },
+
+    render: function(container, commandsStr) {
+      container.innerHTML = '';
+      
+      try {
+        const config = this._parse(commandsStr);
+        let resizeObserver = null;
+        let isDestroyed = false;
+
+        const draw = () => {
+          if (isDestroyed) return;
+          let w = container.clientWidth;
+          let h = container.clientHeight;
+          if (w < 10) w = 400;
+          if (h < 10) h = 400;
+          
+          const result = this._buildSVG(config, w, h);
+          container.innerHTML = result.html;
+          if (!config.noCrop) {
+              container.style.aspectRatio = `${result.W} / ${result.H}`;
+          } else {
+              container.style.aspectRatio = '1 / 1';
+          }
+        };
+
+        // Рисуем первоначально
+        draw();
+        
+        // Слушаем изменения размеров
+        if (typeof ResizeObserver !== 'undefined') {
+          resizeObserver = new ResizeObserver(() => {
+            window.requestAnimationFrame(draw);
+          });
+          resizeObserver.observe(container);
+        }
+        
+        return {
+          destroy: () => {
+            isDestroyed = true;
+            if (resizeObserver) resizeObserver.disconnect();
+            container.innerHTML = '';
+          }
+        };
+      } catch (err) {
+        container.innerHTML = `<div style="color: grey; padding: 20px; font-family: sans-serif;">
+          <b>Ошибка движка графиков:</b><br>${err.message}
+        </div>`;
+        console.warn('FiveCore Graph Engine Error:', err);
+        return { destroy: () => (container.innerHTML = '') };
+      }
+    },
+
+    // ------------------------------------------------------------------------
+    // INTERNAL PARSER (STRICTLY ENGLISH API)
+    // ------------------------------------------------------------------------
+
+    _parse: function(str) {
+      // Очищаем невидимые символы (zero-width spaces), которые часто ломают регулярные выражения при копировании формул
+      str = str.replace(/[\u200B-\u200D\uFEFF]/g, '');
+
+      const config = {
+        axisX: null, axisY: null, grid: true, noCrop: false, pointsInvisibleAll: false, hideTicks: false,
+        mainSequence: [], allPoints: [], pointByName: {},
+        drawMainLine: false, extraLines: [],
+        angles: [], segments: [], equalSegments: [],
+        circle: null, circlePoints: [], circleCenter: null,
+        radii: [], diameters: [], chords: [],
+        inscribed: false, circumscribed: false, inscribedVisible: true, circumscribedVisible: true,
+        diameterInfinite: false, radiusInfinite: false,
+        invisiblePoints: [], invisibleLabelPoints: [], hollowPoints: [], filledPoints: [], tickMarks: [], hatching: [],
+        onLinePoints: [],
+        equations: []
+      };
+
+      const lines = str.split('\n').filter(l => l.trim().length > 0);
+
+      function addNamedPoint(name, x, y, isMain) {
+        const p = { name, x, y };
+        if (name.startsWith('_nameless_')) {
+          p.hideLabel = true;
+        }
+        config.pointByName[name] = p;
+        config.allPoints.push(p);
+        if (isMain) config.mainSequence.push(p);
+        return p;
+      }
+
+      function normalizeVarName(v) {
+         const norm = v.toLowerCase().trim();
+         if (norm === 'а' || norm === 'a') return 'a';
+         if (norm === 'в' || norm === 'b') return 'b';
+         if (norm === 'с' || norm === 'c') return 'c';
+         if (norm === 'к' || norm === 'k') return 'k';
+         if (norm === 'д' || norm === 'd') return 'd';
+         return norm;
+      }
+
+      function isCoefficientCondition(eqStr) {
+         const parts = eqStr.split(/[,;]/);
+         let matchedSome = false;
+         for (let i = 0; i < parts.length; i++) {
+            const p = parts[i].trim();
+            if (!p) continue;
+            const match = p.match(/^([abcdkавсдкABCDKАВСДК])\s*([<>]=?|=+)\s*(-?[\d\.]+)\s*$/);
+            if (!match) return false;
+            matchedSome = true;
+         }
+         return matchedSome;
+      }
+
+      function parseAndGenerateEquation(eqStr) {
+         const parts = eqStr.split(/[,;]/);
+         const constraints = [];
+         
+         for (let i = 0; i < parts.length; i++) {
+            const p = parts[i].trim();
+            if (!p) continue;
+            const match = p.match(/^([abcdkавсдкABCDKАВСДК])\s*([<>]=?|=+)\s*(-?[\d\.]+)\s*$/);
+            if (!match) return null;
+            constraints.push({
+               var: normalizeVarName(match[1]),
+               op: match[2],
+               val: parseFloat(match[3])
+            });
+         }
+
+         if (constraints.length === 0) return null;
+
+         let isLine = constraints.some(c => c.var === 'k' || c.var === 'b');
+         const varsSet = new Set(constraints.map(c => c.var));
+         if (varsSet.has('a') || varsSet.has('c') || varsSet.has('d')) {
+            isLine = false;
+         }
+
+         function checkConstraint(cVal, op, val) {
+            if (op === '<') return cVal < val;
+            if (op === '>') return cVal > val;
+            if (op === '<=') return cVal <= val;
+            if (op === '>=') return cVal >= val;
+            if (op === '=' || op === '==' || op === '===') return Math.abs(cVal - val) < 1e-9;
+            return false;
+         }
+
+         const forced = {};
+         constraints.forEach(c => {
+            if (c.op === '=' || c.op === '==' || c.op === '===') {
+               forced[c.var] = c.val;
+            }
+         });
+
+         for (let attempt = 0; attempt < 1000; attempt++) {
+            if (isLine) {
+               let k = ('k' in forced) ? forced.k : (Math.random() * 5 - 2.5);
+               if (!('k' in forced)) {
+                  if (Math.abs(k) < 0.3) {
+                     k += k >= 0 ? 0.3 : -0.3;
+                  }
+               }
+               let b = ('b' in forced) ? forced.b : (Math.random() * 6 - 3);
+
+               let ok = true;
+               for (const c of constraints) {
+                  let curVal = 0;
+                  if (c.var === 'k') curVal = k;
+                  else if (c.var === 'b') curVal = b;
+                  else continue;
+
+                  if (!checkConstraint(curVal, c.op, c.val)) {
+                     ok = false;
+                     break;
+                  }
+               }
+               if (ok) {
+                  const kTerm = Math.abs(k - 1) < 1e-3 ? 'x' : (Math.abs(k + 1) < 1e-3 ? '-x' : `${k.toFixed(2)}x`);
+                  const bSign = b >= 0 ? '+' : '-';
+                  const bTerm = Math.abs(b) < 1e-3 ? '' : `${bSign}${Math.abs(b).toFixed(2)}`;
+                  return `y = ${kTerm}${bTerm}`;
+               }
+            } else {
+               let a = ('a' in forced) ? forced.a : (Math.random() * 2 - 1);
+               if (!('a' in forced)) {
+                  if (Math.abs(a) < 0.2) {
+                     a += a >= 0 ? 0.2 : -0.2;
+                  }
+               }
+               let b = ('b' in forced) ? forced.b : (Math.random() * 4 - 2);
+               let c = ('c' in forced) ? forced.c : (Math.random() * 6 - 3);
+               let d = b * b - 4 * a * c;
+
+               let ok = true;
+               for (const constr of constraints) {
+                  let curVal = 0;
+                  if (constr.var === 'a') curVal = a;
+                  else if (constr.var === 'b') curVal = b;
+                  else if (constr.var === 'c') curVal = c;
+                  else if (constr.var === 'd') curVal = d;
+                  else continue;
+
+                  if (!checkConstraint(curVal, constr.op, constr.val)) {
+                     ok = false;
+                     break;
+                  }
+               }
+               if (ok) {
+                  const aTerm = Math.abs(a - 1) < 1e-3 ? 'x^2' : (Math.abs(a + 1) < 1e-3 ? '-x^2' : `${a.toFixed(2)}x^2`);
+                  const bSign = b >= 0 ? '+' : '-';
+                  const bTerm = Math.abs(b) < 0.05 ? '' : `${bSign}${Math.abs(b).toFixed(2)}x`;
+                  const cSign = c >= 0 ? '+' : '-';
+                  const cTerm = Math.abs(c) < 0.05 ? '' : `${cSign}${Math.abs(c).toFixed(2)}`;
+                  return `y = ${aTerm}${bTerm}${cTerm}`;
+               }
+            }
+         }
+
+         return isLine ? "y = -x + 2" : "y = -x^2 + 4";
+      }
+
+      lines.forEach(rawLine => {
+        let line = rawLine.trim();
+
+        if (line === '"graph": [' || line === '],' || line === ']' || line === '[') return;
+        
+        if (line.startsWith('"')) line = line.substring(1);
+        if (line.endsWith('",')) line = line.substring(0, line.length - 2);
+        else if (line.endsWith('"')) line = line.substring(0, line.length - 1);
+        else if (line.endsWith(',')) line = line.substring(0, line.length - 1);
+        
+        line = line.trim();
+
+        const lower = line.toLowerCase();
+        if (!lower) return;
+
+        if (lower === 'no_crop') { config.noCrop = true; }
+        else if (lower.startsWith('axis_x:')) { config.axisX = lower.includes('true'); }
+        else if (lower.startsWith('axis_y:')) { config.axisY = lower.includes('true'); }
+        else if (lower.startsWith('grid:')) { config.grid = lower.includes('true'); }
+        else if (lower.startsWith('hide_ticks:')) { config.hideTicks = lower.includes('true'); }
+        else if (lower.startsWith('hatching ')) {
+            const match = line.match(/^hatching\s+(.+);(.+)/i);
+            if (match) config.hatching.push({ from: match[1].trim(), to: match[2].trim() });
+        }
+        else if (lower.startsWith('point ')) {
+            const match = line.match(/^point\s+([^:]+):\s*(-?[\d.]+)[;:,]\s*(-?[\d.]+)/i);
+            if (match) addNamedPoint(match[1].trim(), parseFloat(match[2]), parseFloat(match[3]), true);
+        }
+        else if (lower.startsWith('point_extra ')) {
+            const match = line.match(/^point_extra\s+([^:]+):\s*(-?[\d.]+)[;:,]\s*(-?[\d.]+)/i);
+            if (match) addNamedPoint(match[1].trim(), parseFloat(match[2]), parseFloat(match[3]), false);
+        }
+        else if (lower === 'main_line: true') { config.drawMainLine = true; }
+        else if (lower.startsWith('line_extra ')) {
+            config.extraLines.push(line.substring(11).trim());
+        }
+        else if (lower.startsWith('angle_inner ') || lower.startsWith('angle_outer ')) {
+            const isInner = lower.startsWith('angle_inner');
+            const match = line.match(/^angle_(?:inner|outer)\s+([A-Z]{3})(?:\s+([a-zа-яё]))?:\s*(.*)/i);
+            if (match) {
+               config.angles.push({ 
+                 name: match[1].trim(), 
+                 isInner: isInner, 
+                 colorCode: match[2] ? match[2].toLowerCase() : null,
+                 val: match[3].trim(), 
+                 isRight: match[3].trim() === '90' || match[3].trim() === ''
+               });
+            }
+        }
+        else if (lower.startsWith('equal_segments:')) {
+            const segments = line.substring(15).trim().split(/\s+/);
+            if (segments.length > 0) {
+                config.equalSegments.push(segments);
+            }
+        }
+        else if (lower.startsWith('segment ')) {
+            const match = line.match(/^segment\s+(.+):\s*(.+)/i);
+            if (match) {
+                const segName = match[1].trim();
+                const content = match[2].trim();
+                let text = content;
+                let dirOverride = null;
+                if (content.includes(':')) {
+                    const parts = content.split(':');
+                    text = parts[0].trim();
+                    dirOverride = parts[1].trim();
+                }
+                config.segments.push({ name: segName, text: text, dir: dirOverride });
+            }
+        }
+        else if (lower.startsWith('circle:')) {
+            if (lower.includes('true')) config.circle = { visible: true, r: 5 };
+            else if (lower.includes('invisible')) config.circle = { visible: false, r: 5 };
+            else {
+                const rVal = parseFloat(lower.split(':')[1]);
+                if (!isNaN(rVal)) config.circle = { visible: true, r: rVal };
+            }
+        }
+        else if (lower.startsWith('circle_center:')) {
+            config.circleCenter = line.split(':')[1].trim();
+        }
+        else if (lower.startsWith('circle_point ')) {
+            const match = line.match(/^circle_point\s+(-?[\d.]+):\s*(.+)/i);
+            if (match) {
+                const lbl = match[2].trim();
+                config.circlePoints.push({ deg: parseFloat(match[1]), label: lbl.toLowerCase() === 'true' ? '' : lbl });
+            }
+        }
+        else if (lower.startsWith('radius ')) {
+            const match = line.match(/^radius\s+(-?[\d.]+):\s*(.+)/i);
+            if (match) {
+                const lbl = match[2].trim();
+                config.radii.push({ deg: parseFloat(match[1]), lbl: lbl.toLowerCase() === 'true' ? '' : lbl });
+            }
+        }
+        else if (lower.startsWith('radius_infinite:')) {
+            config.radiusInfinite = lower.includes('true');
+        }
+        else if (lower.startsWith('diameter_infinite:')) {
+            config.diameterInfinite = lower.includes('true');
+        }
+        else if (lower.startsWith('diameter ')) {
+            const match = line.match(/^diameter\s+(-?[\d.]+):\s*(.+)/i);
+            if (match) {
+                const lbl = match[2].trim();
+                config.diameters.push({ deg: parseFloat(match[1]), lbl: lbl.toLowerCase() === 'true' ? '' : lbl });
+            }
+        }
+        else if (lower.startsWith('chord ')) {
+            const match = line.match(/^chord\s+(-?[\d.]+):\s*(-?[\d.]+)/i);
+            if (match) config.chords.push({ deg1: parseFloat(match[1]), deg2: parseFloat(match[2]) });
+        }
+        else if (lower.startsWith('circle_inscribed:')) { 
+            config.inscribed = true; 
+            if (lower.includes('invisible')) config.inscribedVisible = false;
+        }
+        else if (lower.startsWith('circle_circumscribed:')) { 
+            config.circumscribed = true; 
+            if (lower.includes('invisible')) config.circumscribedVisible = false;
+        }
+        else if (lower.startsWith('point_invisible ')) {
+            const match = line.match(/^point_invisible\s+(.+)/i);
+            if (match) config.invisiblePoints.push(match[1].trim());
+        }
+        else if (lower.startsWith('point_label_invisible:')) {
+            config.invisibleLabelPoints.push(line.split(':')[1].trim());
+        }
+        else if (lower.startsWith('points_invisible_all:')) {
+            config.pointsInvisibleAll = lower.includes('true');
+        }
+        else if (lower.startsWith('point_on_line ')) {
+            const match = line.match(/^point_on_line\s+([^ ]+)\s+([a-z]{2}):\s*([\d.]+)%?/i);
+            if (match) {
+                config.onLinePoints.push({
+                   name: match[1].trim(),
+                   line: match[2].trim().toUpperCase(),
+                   dist: parseFloat(match[3])
+                });
+            }
+        }
+        else if (lower.startsWith('point_hollow ')) {
+            const match = line.match(/^point_hollow\s+(.+)/i);
+            if (match) config.hollowPoints.push(match[1].trim());
+        }
+        else if (lower.startsWith('point_filled ')) {
+            const match = line.match(/^point_filled\s+(.+)/i);
+            if (match) config.filledPoints.push(match[1].trim());
+        }
+        else if (lower.startsWith('tick_mark ')) {
+            const match = line.match(/^tick_mark\s+([^:]+):\s*(-?[\d.]+)[;:,]\s*(-?[\d.]+)/i);
+            if (match) {
+                const name = match[1].trim();
+                const x = parseFloat(match[2]);
+                const y = parseFloat(match[3]);
+                config.tickMarks.push({ name, x, y });
+                if (!config.pointByName[name]) {
+                    config.pointByName[name] = { x, y, name };
+                }
+            }
+        }
+        else if (lower.startsWith('graph_equation:')) {
+            let eq = line.substring(15).trim();
+            if (eq) {
+                if (isCoefficientCondition(eq)) {
+                   const gen = parseAndGenerateEquation(eq);
+                   if (gen) eq = gen;
+                }
+                config.equations.push(eq);
+            }
+        }
+        else if (/^[yYуУ]\s*=\s*/.test(line)) {
+            let eq = line;
+            const matchY = line.match(/^[yYуУ]\s*=\s*(.+)$/i);
+            if (matchY) {
+               const rightPart = matchY[1].trim();
+               if (isCoefficientCondition(rightPart)) {
+                  const gen = parseAndGenerateEquation(rightPart);
+                  if (gen) eq = gen;
+               }
+            }
+            config.equations.push(eq);
+        }
+      });
+
+      if (config.axisX === null) config.axisX = (config.equations.length > 0);
+      if (config.axisY === null) config.axisY = (config.equations.length > 0);
+
+
+      let circDataInscribed = null;
+      let circDataCircumscribed = null;
+
+      // Вычисляем окружность по ОСНОВНОЙ ФИГУРЕ
+      if ((config.inscribed || config.circumscribed) && config.mainSequence.length >= 3) {
+        if (config.mainSequence.length === 3) {
+            let pA = config.mainSequence[0];
+            let pB = config.mainSequence[1];
+            let pC = config.mainSequence[2];
+            
+            let a = Math.hypot(pB.x - pC.x, pB.y - pC.y);
+            let b = Math.hypot(pA.x - pC.x, pA.y - pC.y);
+            let c = Math.hypot(pA.x - pB.x, pA.y - pB.y);
+            let p = a + b + c;
+            let s = p / 2;
+            let area = Math.sqrt(s * (s-a) * (s-b) * (s-c)) || 1;
+
+            if (config.inscribed) {
+              let cx = (a*pA.x + b*pB.x + c*pC.x) / p;
+              let cy = (a*pA.y + b*pB.y + c*pC.y) / p;
+              let r = area / s;
+              circDataInscribed = { cx, cy, r };
+            }
+            if (config.circumscribed) {
+              let d = 2 * (pA.x*(pB.y-pC.y) + pB.x*(pC.y-pA.y) + pC.x*(pA.y-pB.y));
+              if (Math.abs(d) > 0.0001) {
+                let cx = ((pA.x*pA.x + pA.y*pA.y)*(pB.y-pC.y) + (pB.x*pB.x + pB.y*pB.y)*(pC.y-pA.y) + (pC.x*pC.x + pC.y*pC.y)*(pA.y-pB.y)) / d;
+                let cy = ((pA.x*pA.x + pA.y*pA.y)*(pC.x-pB.x) + (pB.x*pB.x + pB.y*pB.y)*(pA.x-pC.x) + (pC.x*pC.x + pC.y*pC.y)*(pB.x-pA.x)) / d;
+                let r = (a*b*c) / (4*area);
+                circDataCircumscribed = { cx, cy, r };
+              }
+            }
+        } else {
+            // Для 4 и более точек (например прямоугольника) используем Bounding Box
+            let minX = config.mainSequence[0].x, maxX = config.mainSequence[0].x;
+            let minY = config.mainSequence[0].y, maxY = config.mainSequence[0].y;
+            config.mainSequence.forEach(p => {
+                if (p.x < minX) minX = p.x;
+                if (p.x > maxX) maxX = p.x;
+                if (p.y < minY) minY = p.y;
+                if (p.y > maxY) maxY = p.y;
+            });
+            
+            let cx = (minX + maxX) / 2;
+            let cy = (minY + maxY) / 2;
+            
+            if (config.inscribed) {
+              let r = Math.min(maxX - minX, maxY - minY) / 2;
+              circDataInscribed = { cx, cy, r };
+            }
+            if (config.circumscribed) {
+              let r = 0;
+              config.mainSequence.forEach(p => {
+                  let dist = Math.hypot(p.x - cx, p.y - cy);
+                  if (dist > r) r = dist;
+              });
+              circDataCircumscribed = { cx, cy, r };
+            }
+        }
+      } 
+      
+      let circData = null;
+      if (circDataCircumscribed) circData = circDataCircumscribed;
+      else if (circDataInscribed) circData = circDataInscribed;
+      else if (config.circle) {
+        let cp = config.pointByName[config.circleCenter];
+        circData = { cx: cp ? cp.x : 0, cy: cp ? cp.y : 0, r: config.circle.r || 5 }; 
+      }
+
+
+      if (circData) {
+        if (config.circleCenter) {
+           if (!config.pointByName[config.circleCenter]) {
+               const cp = { x: circData.cx, y: circData.cy, name: config.circleCenter };
+               config.pointByName[config.circleCenter] = cp;
+               config.allPoints.push(cp);
+           } else {
+               config.pointByName[config.circleCenter].x = circData.cx;
+               config.pointByName[config.circleCenter].y = circData.cy;
+           }
+        }
+        config.circlePoints.forEach((cp, idx) => {
+           const pt = getCirclePointMath(circData.cx, circData.cy, circData.r, cp.deg);
+           const name = cp.label || `_dynamic_circle_pt_${idx}`;
+           const dynamicPt = { x: pt.x, y: pt.y, name, hideLabel: !cp.label };
+           if (cp.label && !config.pointByName[cp.label]) {
+             config.pointByName[cp.label] = dynamicPt;
+           }
+           config.allPoints.push(dynamicPt);
+        });
+      }
+
+      if (config.onLinePoints) {
+         config.onLinePoints.forEach(onl => {
+             const p1 = config.pointByName[onl.line.charAt(0)];
+             const p2 = config.pointByName[onl.line.charAt(1)];
+             if (p1 && p2) {
+                 const fraction = onl.dist / 100.0;
+                 const px = p1.x + (p2.x - p1.x) * fraction;
+                 const py = p1.y + (p2.y - p1.y) * fraction;
+                 const newPt = { name: onl.name, x: px, y: py };
+                 config.pointByName[onl.name] = newPt;
+                 config.allPoints.push(newPt);
+             }
+         });
+      }
+
+      config.circData = circData; // Store it for _buildSVG to use
+      config.circDataInscribed = circDataInscribed;
+      config.circDataCircumscribed = circDataCircumscribed;
+
+      return config;
+    },
+
+    // ------------------------------------------------------------------------
+    // INTERNAL SVG RENDERER
+    // ------------------------------------------------------------------------
+
+    _buildSVG: function(config, W, H) {
+      let minX = 0, maxX = 0, minY = 0, maxY = 0;
+      let hasData = false;
+      let svgElements = '';
+
+      let circData = config.circData;
+
+      function findMatchingBrace(str, start) {
+        let count = 1;
+        for (let i = start; i < str.length; i++) {
+          if (str[i] === '{') count++;
+          else if (str[i] === '}') count--;
+          if (count === 0) return i;
+        }
+        return -1;
+      }
+
+      function replaceFrac(expr) {
+        let index;
+        while ((index = expr.indexOf('\\frac{')) !== -1) {
+          let numStart = index + 6;
+          let numEnd = findMatchingBrace(expr, numStart);
+          if (numEnd === -1) break;
+          let denStart = numEnd + 1;
+          if (expr[denStart] !== '{') break;
+          let denEnd = findMatchingBrace(expr, denStart + 1);
+          if (denEnd === -1) break;
+          
+          let num = expr.substring(numStart, numEnd);
+          let den = expr.substring(denStart + 1, denEnd);
+          expr = expr.substring(0, index) + '((' + num + ')/(' + den + '))' + expr.substring(denEnd + 1);
+        }
+        return expr;
+      }
+
+      function compileMathFn(rawExpr) {
+         let pre = rawExpr;
+         pre = pre.replace(/[\u200B-\u200D\uFEFF]/g, '');
+         pre = pre.replace(/\\lvert\s*(.*?)\s*\\rvert/g, 'abs($1)');
+         pre = pre.replace(/\\abs\s*\{([^}]+)\}/g, 'abs($1)');
+         pre = pre.replace(/\\cdot/g, '*');
+         pre = pre.replace(/[хХ]/g, 'x');
+         pre = pre.replace(/\s+/g, '');
+         pre = replaceFrac(pre);
+         pre = pre.replace(/\\/g, '');
+         
+         // Replace pairs of |...| with abs(...)
+         let pipeCount = (pre.match(/\|/g) || []).length;
+         if (pipeCount > 0 && pipeCount % 2 === 0) {
+            let modified = '';
+            let inside = false;
+            for (let i = 0; i < pre.length; i++) {
+               if (pre[i] === '|') {
+                  if (!inside) {
+                     modified += 'abs(';
+                     inside = true;
+                  } else {
+                     modified += ')';
+                     inside = false;
+                  }
+               } else {
+                  modified += pre[i];
+               }
+            }
+            pre = modified;
+         }
+         
+         let index;
+         while ((index = pre.indexOf('^{')) !== -1) {
+            let start = index + 2;
+            let end = findMatchingBrace(pre, start);
+            if (end === -1) break;
+            let content = pre.substring(start, end);
+            pre = pre.substring(0, index) + '^(' + content + ')' + pre.substring(end + 1);
+         }
+         pre = pre.replace(/\{([^}]+)\}/g, '($1)');
+         
+         let last = '';
+         while (last !== pre) {
+            last = pre;
+            pre = pre.replace(/(\d+)([a-zA-Z\(])/g, '$1*$2');
+            pre = pre.replace(/([a-zA-Z\)])(\d+)/g, '$1*$2');
+            pre = pre.replace(/(\))([a-zA-Z\(])/g, '$1*$2');
+            pre = pre.replace(/([x])(\()/g, '$1*$2');
+            pre = pre.replace(/(\))([x])/g, '$1*$2');
+         }
+         pre = pre.replace(/\^/g, '**');
+
+         let safeExpr = pre
+            .replace(/sin/g, 'Math.sin')
+            .replace(/cos/g, 'Math.cos')
+            .replace(/tan/g, 'Math.tan')
+            .replace(/sqrt/g, 'Math.sqrt')
+            .replace(/abs/g, 'Math.abs')
+            .replace(/pi|PI/g, 'Math.PI')
+            .replace(/\b[eE]\b/g, 'Math.E');
+            
+         const cleanTest = safeExpr
+            .replace(/Math\.(sin|cos|tan|sqrt|abs|PI|E)/g, '')
+            .replace(/[\d\.\+\-\*\/\(\)\s,x]/g, '');
+            
+         if (cleanTest.length > 0) {
+            throw new Error(`Недопустимые символы: ${cleanTest}`);
+         }
+         return new Function('x', `try { return ${safeExpr}; } catch(e) { return NaN; }`);
+      }
+
+      function expandBounds(x, y) {
+        if (!hasData) {
+          minX = maxX = x;
+          minY = maxY = y;
+          hasData = true;
+          return;
+        }
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+
+      // Опорные точки для сдвига экрана (учитываются ВСЕ точки)
+      if (config.allPoints.length > 0) {
+        config.allPoints.forEach(p => expandBounds(p.x, p.y));
+      }
+      
+      if (config.tickMarks.length > 0) {
+        config.tickMarks.forEach(t => expandBounds(t.x, t.y));
+      }
+      
+      if (circData) {
+        expandBounds(circData.cx - circData.r, circData.cy - circData.r);
+        expandBounds(circData.cx + circData.r, circData.cy + circData.r);
+      }
+
+      let isEquationBounds = false;
+
+      function determineSmartBounds(equations) {
+         let featuresX = [0]; // always consider near origin
+         let parsedEqs = [];
+         
+         equations.forEach(eqStr => {
+            try {
+               let cleanStr = eqStr.trim();
+               const eqMatch = cleanStr.match(/^[yYуУ]\s*=\s*(.+)$/i);
+               if (eqMatch) cleanStr = eqMatch[1].trim();
+               const fn = compileMathFn(cleanStr);
+               parsedEqs.push(fn);
+            } catch (e) {}
+         });
+
+         if (parsedEqs.length === 0) return null;
+
+         // Step 1: Scan densely from -15 to 15 to find features
+         const scanStartX = -15, scanEndX = 15, scanStep = 0.05;
+         const points = [];
+         
+         for (let x = scanStartX; x <= scanEndX; x += scanStep) {
+            let yVals = [];
+            parsedEqs.forEach(fn => {
+               const y = fn(x);
+               if (typeof y === 'number' && !isNaN(y) && isFinite(y)) {
+                  yVals.push(y);
+               } else {
+                  yVals.push(undefined);
+               }
+            });
+            points.push({ x, yVals });
+         }
+
+         // Find features: roots, extrema, asymptotes
+         for (let i = 2; i < points.length - 2; i++) {
+            const p = points[i];
+            const pPrev = points[i-1];
+            const pNext = points[i+1];
+            const x = p.x;
+
+            parsedEqs.forEach((fn, eqIdx) => {
+               const y = p.yVals[eqIdx];
+               const yPrev = pPrev.yVals[eqIdx];
+               const yNext = pNext.yVals[eqIdx];
+
+               if (y === undefined || yPrev === undefined || yNext === undefined) return;
+
+               // Feature 1: x-intercept (root)
+               if (yPrev * y <= 0 && Math.abs(y - yPrev) < 5) {
+                  featuresX.push(x);
+               }
+
+               // Feature 2: Local extremum
+               const diff1 = y - yPrev;
+               const diff2 = yNext - y;
+               if (diff1 * diff2 < 0 && Math.abs(diff1) < 2 && Math.abs(diff2) < 2) {
+                  featuresX.push(x);
+               }
+
+               // Feature 3: Asymptote transition
+               if (Math.abs(y - yPrev) > 10 && yPrev * y < 0) {
+                  featuresX.push(x);
+               }
+            });
+         }
+
+         let validFeatures = featuresX.filter(fx => {
+            return parsedEqs.some(fn => {
+               const val = fn(fx);
+               return typeof val === 'number' && !isNaN(val) && isFinite(val) && Math.abs(val) <= 8;
+            });
+         });
+
+         if (validFeatures.length === 0) {
+            validFeatures = [0];
+         }
+
+         let fMinX = Math.min(...validFeatures);
+         let fMaxX = Math.max(...validFeatures);
+
+         let curSpanX = fMaxX - fMinX;
+         if (curSpanX < 8) {
+            const midX = (fMinX + fMaxX) / 2;
+            fMinX = midX - 4;
+            fMaxX = midX + 4;
+         } else {
+            const pad = curSpanX * 0.15;
+            fMinX -= pad;
+            fMaxX += pad;
+         }
+
+         if (fMaxX - fMinX > 16 && curSpanX <= 12) {
+            const midX = (fMinX + fMaxX) / 2;
+            fMinX = midX - 8;
+            fMaxX = midX + 8;
+         }
+
+         fMinX = Math.round(fMinX);
+         fMaxX = Math.round(fMaxX);
+
+         if (fMinX > -1 && fMinX < 2) fMinX = -1;
+         if (fMaxX < 1 && fMaxX > -2) fMaxX = 1;
+
+         if (fMaxX <= fMinX) {
+            fMinX = -5;
+            fMaxX = 5;
+         }
+
+         let yPoints = [];
+         const sampleStep = (fMaxX - fMinX) / 40;
+         for (let x = fMinX; x <= fMaxX; x += sampleStep) {
+            parsedEqs.forEach(fn => {
+               const y = fn(x);
+               if (typeof y === 'number' && !isNaN(y) && isFinite(y)) {
+                  if (Math.abs(y) <= 8) {
+                     yPoints.push(y);
+                  }
+               }
+            });
+         }
+
+         let fMinY = -5;
+         let fMaxY = 5;
+         if (yPoints.length > 0) {
+            fMinY = Math.min(...yPoints);
+            fMaxY = Math.max(...yPoints);
+         }
+
+         let curSpanY = fMaxY - fMinY;
+         if (curSpanY < 8) {
+            const midY = (fMinY + fMaxY) / 2;
+            fMinY = midY - 4;
+            fMaxY = midY + 4;
+         } else {
+            const padY = curSpanY * 0.1;
+            fMinY -= padY;
+            fMaxY += padY;
+         }
+
+         if (fMaxY - fMinY > 16) {
+            const midY = (fMinY + fMaxY) / 2;
+            fMinY = midY - 8;
+            fMaxY = midY + 8;
+         }
+
+         fMinY = Math.round(fMinY);
+         fMaxY = Math.round(fMaxY);
+
+         if (fMinY > -1 && fMinY < 2) fMinY = -1;
+         if (fMaxY < 1 && fMaxY > -2) fMaxY = 1;
+
+         if (fMaxY <= fMinY) {
+            fMinY = -5;
+            fMaxY = 5;
+         }
+
+         // Enforce viewport symmetry around origin (0,0) to center the graph axes
+         let maxAbsX = Math.max(Math.abs(fMinX), Math.abs(fMaxX));
+         let maxAbsY = Math.max(Math.abs(fMinY), Math.abs(fMaxY));
+
+         // Guarantee a reasonable minimum viewport magnitude
+         if (maxAbsX < 4) maxAbsX = 4;
+         if (maxAbsY < 4) maxAbsY = 4;
+
+         fMinX = -maxAbsX;
+         fMaxX = maxAbsX;
+         fMinY = -maxAbsY;
+         fMaxY = maxAbsY;
+
+         return { minX: fMinX, maxX: fMaxX, minY: fMinY, maxY: fMaxY };
+      }
+
+      // Smart bounds calculation for equations
+      if (config.equations && config.equations.length > 0) {
+         const bounds = determineSmartBounds(config.equations);
+         if (bounds) {
+            if (!hasData) {
+               minX = bounds.minX;
+               maxX = bounds.maxX;
+               minY = bounds.minY;
+               maxY = bounds.maxY;
+               hasData = true;
+               isEquationBounds = true;
+            } else {
+               // If other geometric features exist we can optionally expand slightly
+               let interestingPoints = [];
+               config.equations.forEach(eqStr => {
+                  try {
+                     let cleanStr = eqStr.trim();
+                     const eqMatch = cleanStr.match(/^[yYуУ]\s*=\s*(.+)$/i);
+                     if (eqMatch) cleanStr = eqMatch[1].trim();
+                     const fn = compileMathFn(cleanStr);
+                     for (let x = bounds.minX; x <= bounds.maxX; x += 0.5) {
+                        const y = fn(x);
+                        if (typeof y === 'number' && !isNaN(y) && isFinite(y)) {
+                           if (Math.abs(y) <= bounds.maxY && Math.abs(y) >= bounds.minY) {
+                              interestingPoints.push({ x, y });
+                           }
+                        }
+                     }
+                  } catch (e) {}
+               });
+               interestingPoints.forEach(p => {
+                  expandBounds(p.x, p.y);
+               });
+            }
+         }
+      }
+
+      if (config.noCrop) {
+         let maxAbs = 10;
+         if (hasData) {
+            maxAbs = Math.max(
+               maxAbs,
+               Math.abs(minX),
+               Math.abs(maxX),
+               Math.abs(minY),
+               Math.abs(maxY)
+            );
+         }
+         maxAbs = Math.ceil(maxAbs);
+         minX = -maxAbs;
+         maxX = maxAbs;
+         minY = -maxAbs;
+         maxY = maxAbs;
+         hasData = true;
+         isEquationBounds = true;
+      }
+
+      if (!hasData) {
+        minX = -10; maxX = 10; minY = -10; maxY = 10;
+      } else if (!isEquationBounds) {
+        if (Math.abs(maxX - minX) < 0.1) { minX -= 1; maxX += 1; }
+        if (Math.abs(maxY - minY) < 0.1) { minY -= 1; maxY += 1; }
+        
+        // Add a padding to the bounds so points aren't exactly on the edge
+        const padX = (maxX - minX) * 0.05;
+        const padY = (maxY - minY) * 0.05;
+        minX -= padX; maxX += padX;
+        minY -= padY; maxY += padY;
+      }
+
+      let scale = 1, offsetX = 0, offsetY = 0;
+      function computeScale(cMinX, cMaxX, cMinY, cMaxY, useAutoH=false) {
+         const padding = 20; 
+         const mathWidth = cMaxX - cMinX;
+         const mathHeight = Math.max(cMaxY - cMinY, 0.1);
+         const scaleX = (W - padding * 2) / mathWidth;
+         
+         if (useAutoH && !config.noCrop) {
+             H = Math.min(W, mathHeight * scaleX + padding * 2);
+         }
+
+         const scaleY = (H - padding * 2) / mathHeight;
+         scale = Math.min(scaleX, scaleY);
+         offsetX = padding + ((W - padding * 2) - mathWidth * scale) / 2;
+         offsetY = padding + ((H - padding * 2) - mathHeight * scale) / 2;
+      }
+      
+      computeScale(minX, maxX, minY, maxY, true);
+
+      // Smart bounds expansion for labels
+      let expanded = false;
+      let nextMinX = minX, nextMaxX = maxX, nextMinY = minY, nextMaxY = maxY;
+      
+      config.allPoints.forEach(p => {
+          if (p.name && !p.hideLabel && !p.name.startsWith('_dynamic')) {
+             let px = offsetX + (p.x - minX) * scale;
+             let py = offsetY + (maxY - p.y) * scale;
+             // Require 40px safe space from the boundary for labeled points
+             if (px < 40) { nextMinX -= (40 - px) / scale; expanded = true; }
+             if (px > W - 40) { nextMaxX += (px - (W - 40)) / scale; expanded = true; }
+             if (py < 40) { nextMaxY += (40 - py) / scale; expanded = true; }
+             if (py > H - 40) { nextMinY -= (py - (H - 40)) / scale; expanded = true; }
+          }
+      });
+
+      if (expanded) {
+          minX = nextMinX; maxX = nextMaxX; minY = nextMinY; maxY = nextMaxY;
+          computeScale(minX, maxX, minY, maxY, true);
+      }
+
+      function mapX(x) { return offsetX + (x - minX) * scale; }
+      function mapY(y) { return offsetY + (maxY - y) * scale; } 
+      function unmapX(px) { return minX + (px - offsetX) / scale; }
+      function unmapY(py) { return maxY - (py - offsetY) / scale; }
+
+      const mathLeft = unmapX(0);
+      const mathRight = unmapX(W);
+      const mathTop = unmapY(0);
+      const mathBottom = unmapY(H);
+
+      function tag(name, attrs, content='') {
+        let a = Object.keys(attrs).map(k => `${k}="${attrs[k]}"`).join(' ');
+        return `<${name} ${a}>${content}</${name}>`;
+      }
+      function lineStr(x1, y1, x2, y2, col=THEME.text, w=2, dash='') {
+        return tag('line', {x1:mapX(x1).toFixed(1), y1:mapY(y1).toFixed(1), x2:mapX(x2).toFixed(1), y2:mapY(y2).toFixed(1), stroke:col, 'stroke-width':w, 'stroke-dasharray':dash});
+      }
+      function linePx(px1, py1, px2, py2, col=THEME.text, w=2, dash='') {
+        return tag('line', {x1:px1.toFixed(1), y1:py1.toFixed(1), x2:px2.toFixed(1), y2:py2.toFixed(1), stroke:col, 'stroke-width':w, 'stroke-dasharray':dash});
+      }
+      function textNodePx(px, py, str, anchor='middle', baseline='middle', col=THEME.text, size='14px') {
+        let bl = baseline;
+        if (bl === 'top') bl = 'hanging';
+        if (bl === 'bottom') bl = 'alphabetic';
+        return tag('text', {
+          x: px.toFixed(1),
+          y: py.toFixed(1),
+          fill: col,
+          'text-anchor': anchor,
+          'dominant-baseline': bl,
+          style: `font-family: 'Nunito', sans-serif; font-size: ${size}; font-weight: bold;`
+        }, str);
+      }
+      function mathNodePx(px, py, str, anchor='middle', baseline='middle', col=THEME.text, fontSize='16px') {
+        if (window.katex && typeof str === 'string' && str.trim().startsWith('$') && str.trim().endsWith('$') && str.trim().length > 1) {
+           try {
+              let cleanStr = str.trim().slice(1, -1).trim();
+              const html = window.katex.renderToString(cleanStr, { throwOnError: false });
+              const w = 150, h = 60;
+              let x = px; let y = py;
+              let jContent = 'center'; let aItems = 'center';
+
+              if (anchor === 'middle') { x -= w/2; jContent = 'center'; }
+              else if (anchor === 'start') { jContent = 'flex-start'; }
+              else if (anchor === 'end') { x -= w; jContent = 'flex-end'; }
+
+              if (baseline === 'middle') { y -= h/2; }
+              else if (baseline === 'top' || baseline === 'hanging') { aItems = 'flex-start'; }
+              else if (baseline === 'bottom' || baseline === 'alphabetic') { y -= h; aItems = 'flex-end'; }
+
+              return tag('foreignObject', {x:x.toFixed(1), y:y.toFixed(1), width:w, height:h, style:'pointer-events:none;overflow:visible;'},
+                `<div xmlns="http://www.w3.org/1999/xhtml" style="width:100%;height:100%;display:flex;justify-content:${jContent};align-items:${aItems};color:${col};font-size:${fontSize};">${html}</div>`
+              );
+           } catch(e){}
+        }
+        // If not LaTeX or failed, remove $ just in case if it's there
+        let plainStr = (typeof str === 'string') ? str : '';
+        if (plainStr.startsWith('$') && plainStr.endsWith('$') && plainStr.length > 1) plainStr = plainStr.slice(1, -1);
+        return textNodePx(px, py, plainStr, anchor, baseline, col, fontSize);
+      }
+      function textNode(x, y, str, anchor='middle', baseline='middle', col=THEME.text, offsetPxX=0, offsetPxY=-15) {
+        return mathNodePx(mapX(x)+offsetPxX, mapY(y)+offsetPxY, str, anchor, baseline, col);
+      }
+      function circleNode(x, y, rPx, fill=THEME.point, stroke='none', w=0) {
+        return tag('circle', {cx:mapX(x).toFixed(1), cy:mapY(y).toFixed(1), r:rPx, fill, stroke, 'stroke-width':w});
+      }
+      function rectNodePx(px, py, w, h, fill=THEME.bg, rx=4) {
+        return tag('rect', {x:px.toFixed(1), y:py.toFixed(1), width:w, height:h, fill, rx});
+      }
+
+      // --- ГРИД ---
+      if (config.grid) {
+        const startX = Math.floor(mathLeft); const endX = Math.ceil(mathRight);
+        const startY = Math.floor(mathBottom); const endY = Math.ceil(mathTop);
+        for(let i=startX; i<=endX; i++) svgElements += linePx(mapX(i), mapY(mathBottom), mapX(i), mapY(mathTop), THEME.grid, 0.75);
+        for(let i=startY; i<=endY; i++) svgElements += linePx(mapX(mathLeft), mapY(i), mapX(mathRight), mapY(i), THEME.grid, 0.75);
+      }
+
+      // --- ОСИ ---
+      if (config.axisX && mathBottom <= 0 && mathTop >= 0) {
+        const pxR = mapX(mathRight);
+        const pyZ = mapY(0);
+        svgElements += linePx(mapX(mathLeft), pyZ, pxR - 10, pyZ, THEME.axis, 2);
+        svgElements += tag('polygon', {points:`${pxR},${pyZ} ${pxR-14},${pyZ-4} ${pxR-10},${pyZ} ${pxR-14},${pyZ+4}`, fill:THEME.axis});
+        svgElements += mathNodePx(pxR - 4, pyZ + 10, '$x$', 'middle', 'top', THEME.axisText);
+      }
+      if (config.axisY && mathLeft <= 0 && mathRight >= 0) {
+        const pxZ = mapX(0);
+        const pyT = mapY(mathTop);
+        svgElements += linePx(pxZ, mapY(mathBottom), pxZ, pyT + 10, THEME.axis, 2);
+        svgElements += tag('polygon', {points:`${pxZ},${pyT} ${pxZ-4},${pyT+14} ${pxZ},${pyT+10} ${pxZ+4},${pyT+14}`, fill:THEME.axis});
+        svgElements += mathNodePx(pxZ + 14, pyT + 12, '$y$', 'middle', 'middle', THEME.axisText);
+      }
+
+      // --- TICK MARKS (КООРДИНАТНАЯ ПРЯМАЯ ИЛИ АВТО-ОТМЕТКИ Осей) ---
+      if (config.tickMarks.length > 0 && !config.hideTicks) {
+         config.tickMarks.forEach(t => {
+           const px = mapX(t.x);
+           const py = mapY(t.y);
+           svgElements += linePx(px, py - 6, px, py + 6, THEME.axis, 2);
+           svgElements += mathNodePx(px, py + 12, t.name, 'middle', 'top', THEME.axis, '12px');
+         });
+      } else if (config.equations && config.equations.length > 0 && !config.hideTicks) {
+         // Автоматические числовые отметки для режима ГРАФИКОВ
+         // Динамический расчет шага делений (интеллектуальное масштабирование), чтобы исключить наложение
+         function findNiceStep(mathSpan, targetCount = 10) {
+            const rawStep = mathSpan / targetCount;
+            const log10 = Math.log10(rawStep);
+            const power0 = Math.pow(10, Math.floor(log10));
+            const ratio = rawStep / power0;
+            
+            let step;
+            if (ratio < 1.5) step = 1 * power0;
+            else if (ratio < 3.0) step = 2 * power0;
+            else if (ratio < 7.0) step = 5 * power0;
+            else step = 10 * power0;
+            
+            return step;
+         }
+
+         const spanX = mathRight - mathLeft;
+         const spanY = mathTop - mathBottom;
+         const stepX = findNiceStep(spanX, 10);
+          const stepY = findNiceStep(spanY, 10);
+
+          if (config.axisX) {
+             let pyZ = mapY(0);
+             if (pyZ < 15) pyZ = 15;
+             if (pyZ > H - 25) pyZ = H - 25;
+
+             const startTick = Math.ceil(mathLeft / stepX) * stepX;
+             const endTick = Math.floor(mathRight / stepX) * stepX;
+             let count = 0;
+             for (let val = startTick; val <= endTick && count < 200; val += stepX) {
+                count++;
+                const cleanVal = parseFloat(val.toFixed(5));
+                if (Math.abs(cleanVal) < 1e-9) continue;
+
+                const px = mapX(cleanVal);
+                if (px <= W - 8 && px >= 8) {
+                   svgElements += linePx(px, pyZ - 4, px, pyZ + 4, THEME.axis, 1.5);
+                   
+                   let offsetPxY = 11;
+                   let offsetPxX = 0;
+                   let fontSize = '10.5px';
+
+                   svgElements += textNodePx(px + offsetPxX, pyZ + offsetPxY, String(cleanVal), 'middle', 'top', THEME.axisText, fontSize);
+                }
+             }
+          }
+          if (config.axisY) {
+             let pxZ = mapX(0);
+             if (pxZ < 25) pxZ = 25;
+             if (pxZ > W - 15) pxZ = W - 15;
+
+             const startTick = Math.ceil(mathBottom / stepY) * stepY;
+             const endTick = Math.floor(mathTop / stepY) * stepY;
+             let count = 0;
+             for (let val = startTick; val <= endTick && count < 200; val += stepY) {
+                count++;
+                const cleanVal = parseFloat(val.toFixed(5));
+                if (Math.abs(cleanVal) < 1e-9) continue;
+
+                const py = mapY(cleanVal);
+                if (py <= H - 8 && py >= 8) {
+                   svgElements += linePx(pxZ - 4, py, pxZ + 4, py, THEME.axis, 1.5);
+                   
+                   let offsetPxX = -11;
+                   let offsetPxY = 0;
+                   let fontSize = '10.5px';
+
+                   svgElements += textNodePx(pxZ + offsetPxX, py + offsetPxY, String(cleanVal), 'end', 'middle', THEME.axisText, fontSize);
+                }
+             }
+             // Поставим маленькую циферку 0 у начала координат
+             let pyZ_zero = mapY(0);
+             if (pyZ_zero < 15) pyZ_zero = 15;
+             if (pyZ_zero > H - 25) pyZ_zero = H - 25;
+             
+             if (pxZ > 8 && pxZ < W - 8 && pyZ_zero > 8 && pyZ_zero < H - 8) {
+                svgElements += textNodePx(pxZ - 5, pyZ_zero + 3, '0', 'end', 'top', THEME.axisText, '10.5px');
+             }
+          }
+       }
+
+       // --- ГРАФИКИ УРАВНЕНИЙ (ФУНКЦИЙ) ---
+      if (config.equations && config.equations.length > 0) {
+         const equationColors = ['#1CB0F6', '#0050C8', '#58CC02', '#FF9600', '#B87CF8'];
+         config.equations.forEach((eqStr, idx) => {
+            try {
+               let cleanStr = eqStr.trim();
+               const eqMatch = cleanStr.match(/^[yYуУ]\s*=\s*(.+)$/i);
+               if (eqMatch) cleanStr = eqMatch[1].trim();
+               
+               const fn = compileMathFn(cleanStr);
+               const color = equationColors[idx % equationColors.length];
+               
+               // Строим плавную кривую
+               const numSteps = 500;
+               const mathWidth = mathRight - mathLeft;
+               const step = mathWidth / numSteps;
+               
+               let pathData = '';
+               let inPath = false;
+               let prevY = null;
+               
+               for (let i = 0; i <= numSteps; i++) {
+                  const x = mathLeft + i * step;
+                  const y = fn(x);
+                  
+                  const isValid = (typeof y === 'number' && !isNaN(y) && isFinite(y) && Math.abs(y) < 1000);
+                  if (isValid) {
+                     const px = mapX(x);
+                     const py = mapY(y);
+                     
+                     let isJump = false;
+                     if (prevY !== null) {
+                        const mathHeight = mathTop - mathBottom;
+                        if (Math.sign(y) !== Math.sign(prevY) && Math.abs(y - prevY) > mathHeight * 1.5) {
+                           isJump = true;
+                        }
+                     }
+                     
+                     if (!inPath || isJump) {
+                        pathData += ` M ${px.toFixed(1)} ${py.toFixed(1)}`;
+                        inPath = true;
+                     } else {
+                        pathData += ` L ${px.toFixed(1)} ${py.toFixed(1)}`;
+                     }
+                     prevY = y;
+                  } else {
+                     inPath = false;
+                     prevY = null;
+                  }
+               }
+               
+               if (pathData) {
+                  svgElements += tag('path', { d: pathData, fill: 'none', stroke: color, 'stroke-dasharray': '', 'stroke-width': 3 });
+               }
+            } catch (err) {
+               console.warn("Failed drawing equation "+eqStr+":", err);
+            }
+         });
+      }
+
+      // --- HATCHING ---
+      if (config.hatching.length > 0) {
+          let defs = '';
+          let hatchingsSVG = '';
+          config.hatching.forEach((h, i) => {
+              let yH = 0;
+              let p1 = config.pointByName[h.from];
+              let p2 = config.pointByName[h.to];
+              if (p1 && p1.y !== undefined) yH = p1.y;
+              else if (p2 && p2.y !== undefined) yH = p2.y;
+              
+              const canvasW = mathRight - mathLeft;
+              let x1 = h.from === '-inf' ? mathLeft - canvasW : (p1 ? p1.x : parseFloat(h.from));
+              let x2 = h.to === '+inf' ? mathRight + canvasW : (p2 ? p2.x : parseFloat(h.to));
+              
+              if (x1 > x2) { let t = x1; x1 = x2; x2 = t; }
+              const px1 = mapX(x1);
+              const px2 = mapX(x2);
+              const py = mapY(yH);
+              
+              const hatchH = 26;
+              const clipId = `clip-hatch-${i}`;
+              defs += `<clipPath id="${clipId}"><rect x="${px1.toFixed(1)}" y="${(py-hatchH).toFixed(1)}" width="${(px2-px1).toFixed(1)}" height="${hatchH}"/></clipPath>`;
+              
+              let lines = '';
+              for (let k = px1 - hatchH; k <= px2 + hatchH; k += 16) {
+                 lines += linePx(k, py, k + hatchH*0.7, py - hatchH, THEME.accent, 2);
+              }
+              hatchingsSVG += `<g clip-path="url(#${clipId})">${lines}</g>`;
+          });
+          svgElements += `<defs>${defs}</defs>` + hatchingsSVG;
+      }
+
+      // --- ОСНОВНАЯ ЛИНИЯ ---
+      if (config.drawMainLine && config.mainSequence.length > 1) {
+        let d = `M ${mapX(config.mainSequence[0].x).toFixed(1)} ${mapY(config.mainSequence[0].y).toFixed(1)}`;
+        for(let i=1; i<config.mainSequence.length; i++) {
+          d += ` L ${mapX(config.mainSequence[i].x).toFixed(1)} ${mapY(config.mainSequence[i].y).toFixed(1)}`;
+        }
+        d += ` Z`;
+        svgElements += tag('path', {d, fill:'none', stroke:THEME.accent, 'stroke-width':3});
+      }
+
+      // --- ДОП ЛИНИИ ---
+      config.extraLines.forEach(lName => {
+        const p1 = config.pointByName[lName.charAt(0)];
+        const p2 = config.pointByName[lName.charAt(1)];
+        if (p1 && p2) svgElements += lineStr(p1.x, p1.y, p2.x, p2.y, THEME.accent, 3);
+      });
+
+      // --- ПОДПИСИ ОТРЕЗКОВ ---
+      let figureCx = 0, figureCy = 0;
+      if (config.mainSequence.length > 0) {
+          config.mainSequence.forEach(p => { figureCx += p.x; figureCy += p.y; });
+          figureCx /= config.mainSequence.length;
+          figureCy /= config.mainSequence.length;
+      }
+
+      function distToSegmentPx(px, py, x1, y1, x2, y2) {
+         const dx = x2 - x1;
+         const dy = y2 - y1;
+         const lenSq = dx * dx + dy * dy;
+         if (lenSq < 1e-6) return Math.hypot(px - x1, py - y1);
+         let t = ((px - x1) * dx + (py - y1) * dy) / lenSq;
+         t = Math.max(0, Math.min(1, t));
+         return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+      }
+
+      const activeLineSegs = [];
+      if (config.drawMainLine && config.mainSequence.length > 1) {
+         for (let i = 0; i < config.mainSequence.length; i++) {
+            const pA = config.mainSequence[i];
+            const pB = config.mainSequence[(i + 1) % config.mainSequence.length];
+            activeLineSegs.push({ name: pA.name + pB.name, x1: mapX(pA.x), y1: mapY(pA.y), x2: mapX(pB.x), y2: mapY(pB.y) });
+         }
+      }
+      config.extraLines.forEach(lName => {
+         const pA = config.pointByName[lName.charAt(0)];
+         const pB = config.pointByName[lName.charAt(1)];
+         if (pA && pB) {
+            activeLineSegs.push({ name: lName, x1: mapX(pA.x), y1: mapY(pA.y), x2: mapX(pB.x), y2: mapY(pB.y) });
+         }
+      });
+      
+      config.segments.forEach(seg => {
+        const p1 = config.pointByName[seg.name.charAt(0)];
+        const p2 = config.pointByName[seg.name.charAt(1)];
+        if (p1 && p2) {
+          const midX = (p1.x + p2.x) / 2;
+          const midY = (p1.y + p2.y) / 2;
+          
+          const dxPx = mapX(p2.x) - mapX(p1.x);
+          const dyPx = mapY(p2.y) - mapY(p1.y);
+          const lenPx = Math.sqrt(dxPx*dxPx + dyPx*dyPx);
+          
+          let nxPx = 0, nyPx = -1;
+          if (lenPx > 0) {
+             const n1x = -dyPx / lenPx;
+             const n1y = dxPx / lenPx;
+             const n2x = -n1x;
+             const n2y = -n1y;
+             
+             if (seg.dir) {
+                const dirOverride = seg.dir.toLowerCase();
+                if (dirOverride === 'left') {
+                   if (Math.abs(n1x) > 0.1) {
+                      if (n1x < 0) { nxPx = n1x; nyPx = n1y; } else { nxPx = n2x; nyPx = n2y; }
+                   } else { nxPx = -1; nyPx = 0; }
+                } else if (dirOverride === 'right') {
+                   if (Math.abs(n1x) > 0.1) {
+                      if (n1x > 0) { nxPx = n1x; nyPx = n1y; } else { nxPx = n2x; nyPx = n2y; }
+                   } else { nxPx = 1; nyPx = 0; }
+                } else if (dirOverride === 'top' || dirOverride === 'above') {
+                   if (Math.abs(n1y) > 0.1) {
+                      if (n1y < 0) { nxPx = n1x; nyPx = n1y; } else { nxPx = n2x; nyPx = n2y; }
+                   } else { nxPx = 0; nyPx = -1; }
+                } else if (dirOverride === 'bottom' || dirOverride === 'below') {
+                   if (Math.abs(n1y) > 0.1) {
+                      if (n1y > 0) { nxPx = n1x; nyPx = n1y; } else { nxPx = n2x; nyPx = n2y; }
+                   } else { nxPx = 0; nyPx = 1; }
+                }
+             } else {
+                const cand1x = mapX(midX) + n1x * 22;
+                const cand1y = mapY(midY) + n1y * 22;
+                const cand2x = mapX(midX) + n2x * 22;
+                const cand2y = mapY(midY) + n2y * 22;
+                
+                let dist1 = 999999;
+                let dist2 = 999999;
+                
+                activeLineSegs.forEach(line => {
+                   if (line.name === seg.name || line.name === (seg.name.charAt(1) + seg.name.charAt(0))) {
+                      return;
+                   }
+                   const d1 = distToSegmentPx(cand1x, cand1y, line.x1, line.y1, line.x2, line.y2);
+                   const d2 = distToSegmentPx(cand2x, cand2y, line.x1, line.y1, line.x2, line.y2);
+                   if (d1 < dist1) dist1 = d1;
+                   if (d2 < dist2) dist2 = d2;
+                });
+                
+                const threshold = 18;
+                if (dist1 < threshold || dist2 < threshold || Math.abs(dist1 - dist2) > 8) {
+                   if (dist1 > dist2) {
+                      nxPx = n1x;
+                      nyPx = n1y;
+                   } else {
+                      nxPx = n2x;
+                      nyPx = n2y;
+                   }
+                } else {
+                   if (config.mainSequence.length > 0) {
+                      const vx = mapX(midX) - mapX(figureCx);
+                      const vy = mapY(midY) - mapY(figureCy);
+                      const dot1 = n1x * vx + n1y * vy;
+                      const dot2 = n2x * vx + n2y * vy;
+                      if (dot1 > 0.1) {
+                         nxPx = n1x;
+                         nyPx = n1y;
+                      } else if (dot2 > 0.1) {
+                         nxPx = n2x;
+                         nyPx = n2y;
+                      } else {
+                         nxPx = n1x;
+                         nyPx = n1y;
+                      }
+                   } else {
+                      nxPx = n1x;
+                      nyPx = n1y;
+                   }
+                }
+             }
+          }
+          
+          let displayVal = seg.text;
+          if (displayVal.match(/^[A-Za-z0-9_]+$/)) displayVal = '$' + displayVal + '$';
+          
+          svgElements += mathNodePx(mapX(midX) + nxPx * 20, mapY(midY) + nyPx * 20, displayVal, 'middle', 'middle', THEME.accent);
+        }
+      });
+
+      // --- МЕТКИ ОДИНАКОВЫХ ОТРЕЗКОВ ---
+      config.equalSegments.forEach((group, idx) => {
+        const numDashes = idx + 1;
+        group.forEach(segName => {
+          if (segName.length !== 2) return;
+          const p1 = config.pointByName[segName.charAt(0)];
+          const p2 = config.pointByName[segName.charAt(1)];
+          if (p1 && p2) {
+            const px1 = mapX(p1.x);
+            const py1 = mapY(p1.y);
+            const px2 = mapX(p2.x);
+            const py2 = mapY(p2.y);
+            
+            const midX = (px1 + px2) / 2;
+            const midY = (py1 + py2) / 2;
+            
+            const ang = Math.atan2(py2 - py1, px2 - px1);
+            const perp = ang + Math.PI / 2;
+            
+            const spacing = 6;
+            const dashLen = 8;
+            
+            let startOff = -(numDashes - 1) * spacing / 2;
+            for (let i = 0; i < numDashes; i++) {
+                const cx = midX + Math.cos(ang) * startOff;
+                const cy = midY + Math.sin(ang) * startOff;
+                
+                const dashX1 = cx + Math.cos(perp) * dashLen;
+                const dashY1 = cy + Math.sin(perp) * dashLen;
+                const dashX2 = cx - Math.cos(perp) * dashLen;
+                const dashY2 = cy - Math.sin(perp) * dashLen;
+                
+                svgElements += tag('path', {
+                    d: `M ${dashX1.toFixed(1)} ${dashY1.toFixed(1)} L ${dashX2.toFixed(1)} ${dashY2.toFixed(1)}`,
+                    fill: 'none',
+                    stroke: THEME.accent,
+                    'stroke-width': 2
+                });
+                startOff += spacing;
+            }
+          }
+        });
+      });
+
+      // --- ОКРУЖНОСТЬ ---
+      if (config.circDataInscribed && config.inscribedVisible !== false) {
+         svgElements += circleNode(config.circDataInscribed.cx, config.circDataInscribed.cy, config.circDataInscribed.r * scale, 'none', THEME.accent, 3);
+      }
+      if (config.circDataCircumscribed && config.circumscribedVisible !== false) {
+         svgElements += circleNode(config.circDataCircumscribed.cx, config.circDataCircumscribed.cy, config.circDataCircumscribed.r * scale, 'none', THEME.accent, 3);
+      }
+      if (circData && config.circle && config.circle.visible) {
+         svgElements += circleNode(circData.cx, circData.cy, circData.r * scale, 'none', THEME.accent, 3);
+      }
+
+      if (circData) {
+        config.radii.forEach(rd => {
+          const pt = getCirclePointMath(circData.cx, circData.cy, circData.r, rd.deg);
+          
+          if (rd.infinite || config.radiusInfinite) {
+             const dx = pt.x - circData.cx, dy = pt.y - circData.cy;
+             svgElements += linePx(mapX(circData.cx), mapY(circData.cy), mapX(circData.cx + dx*100), mapY(circData.cy + dy*100), THEME.text, 2, '5,5');
+          } else {
+             svgElements += lineStr(circData.cx, circData.cy, pt.x, pt.y, THEME.text, 2, '5,5');
+          }
+
+          if (rd.lbl && rd.lbl !== '?') {
+            const midX = (circData.cx + pt.x)/2, midY = (circData.cy + pt.y)/2;
+            svgElements += rectNodePx(mapX(midX)-12, mapY(midY)-10, 24, 20);
+            svgElements += textNode(midX, midY, rd.lbl, 'middle', 'middle', THEME.text, 0, 0);
+          } else if (rd.lbl === '?') {
+            const midX = (circData.cx + pt.x)/2, midY = (circData.cy + pt.y)/2;
+            svgElements += textNode(midX, midY, '?', 'middle', 'middle', THEME.text, 0, 0);
+          }
+        });
+
+        config.diameters.forEach(dm => {
+          const pt1 = getCirclePointMath(circData.cx, circData.cy, circData.r, dm.deg);
+          const pt2 = getCirclePointMath(circData.cx, circData.cy, circData.r, (dm.deg + 180)%360);
+          
+          if (dm.infinite || config.diameterInfinite) {
+             const dx = pt1.x - pt2.x, dy = pt1.y - pt2.y;
+             svgElements += linePx(mapX(pt2.x - dx*100), mapY(pt2.y - dy*100), mapX(pt1.x + dx*100), mapY(pt1.y + dy*100), THEME.text, 2, '5,5');
+          } else {
+             svgElements += lineStr(pt1.x, pt1.y, pt2.x, pt2.y, THEME.text, 2, '5,5');
+          }
+          if (dm.lbl) {
+            svgElements += rectNodePx(mapX(circData.cx)-12, mapY(circData.cy)-20, 24, 20);
+            svgElements += textNode(circData.cx, circData.cy, dm.lbl, 'middle', 'middle', THEME.text, 0, -10);
+          }
+        });
+
+        config.chords.forEach(ch => {
+          const pt1 = getCirclePointMath(circData.cx, circData.cy, circData.r, ch.deg1);
+          const pt2 = getCirclePointMath(circData.cx, circData.cy, circData.r, ch.deg2);
+          svgElements += lineStr(pt1.x, pt1.y, pt2.x, pt2.y, THEME.accent, 3);
+        });
+      }
+
+      // --- УГЛЫ ---
+      const angleSectorObstacles = [];
+      config.angles.forEach(ang => {
+        if (ang.name.length !== 3) return;
+        const p1 = config.pointByName[ang.name.charAt(0)];
+        const center = config.pointByName[ang.name.charAt(1)];
+        const p2 = config.pointByName[ang.name.charAt(2)];
+        
+        if (p1 && center && p2) {
+          const pxC = mapX(center.x), pyC = mapY(center.y);
+          const px1 = mapX(p1.x), py1 = mapY(p1.y);
+          const px2 = mapX(p2.x), py2 = mapY(p2.y);
+          const ang1 = Math.atan2(py1 - pyC, px1 - pxC);
+          const ang2 = Math.atan2(py2 - pyC, px2 - pxC);
+          
+          const colorsMapping = { 'ж': '#facc15', 'к': '#fb7185', 'з': '#4ade80', 'с': '#60a5fa', 'г': '#38bdf8' };
+          const strokeColor = ang.colorCode && colorsMapping[ang.colorCode] ? colorsMapping[ang.colorCode] : THEME.text;
+          const fillColor = ang.colorCode && colorsMapping[ang.colorCode] ? colorsMapping[ang.colorCode] : THEME.text;
+          const fillOpacity = ang.colorCode ? 0.35 : 0.05;
+
+          const dist1 = Math.hypot(px1 - pxC, py1 - pyC);
+          const dist2 = Math.hypot(px2 - pxC, py2 - pyC);
+          const distPx = Math.max(12, Math.min(dist1, dist2) * 0.18);
+
+          let diff = ang2 - ang1; 
+          while (diff <= -Math.PI) diff += 2 * Math.PI;
+          while (diff > Math.PI) diff -= 2 * Math.PI; 
+          
+          let startAng, endAng;
+          if (diff > 0) {
+              startAng = ang1; endAng = ang2;
+          } else {
+              startAng = ang2; endAng = ang1;
+          }
+          let sweep = 1;
+          let large = 0;
+
+          if (!ang.isInner) {
+              let t = startAng;
+              startAng = endAng;
+              endAng = t;
+              sweep = 1;
+              large = 1;
+          }
+
+          if (ang.isRight && (!ang.val || ang.val === '90')) {
+             const v1x = Math.cos(startAng)*distPx, v1y = Math.sin(startAng)*distPx;
+             const v2x = Math.cos(endAng)*distPx, v2y = Math.sin(endAng)*distPx;
+             const pxx1 = pxC + v1x, pyy1 = pyC + v1y;
+             const pxx3 = pxC + v2x, pyy3 = pyC + v2y;
+             const pxx2 = pxC + v1x + v2x, pyy2 = pyC + v1y + v2y;
+             const dFull = `M ${pxC.toFixed(1)} ${pyC.toFixed(1)} L ${pxx1.toFixed(1)} ${pyy1.toFixed(1)} L ${pxx2.toFixed(1)} ${pyy2.toFixed(1)} L ${pxx3.toFixed(1)} ${pyy3.toFixed(1)} Z`;
+             svgElements += tag('path', {d: dFull, fill: fillColor, 'fill-opacity': fillOpacity, stroke: 'none'});
+             const dLine = `M ${pxx1.toFixed(1)} ${pyy1.toFixed(1)} L ${pxx2.toFixed(1)} ${pyy2.toFixed(1)} L ${pxx3.toFixed(1)} ${pyy3.toFixed(1)}`;
+             svgElements += tag('path', {d: dLine, fill:'none', stroke: strokeColor, 'stroke-width':2});
+          } else {
+             const pxx1 = pxC + Math.cos(startAng) * distPx;
+             const pyy1 = pyC + Math.sin(startAng) * distPx;
+             const pxx2 = pxC + Math.cos(endAng) * distPx;
+             const pyy2 = pyC + Math.sin(endAng) * distPx;
+             const dFull = `M ${pxC.toFixed(1)} ${pyC.toFixed(1)} L ${pxx1.toFixed(1)} ${pyy1.toFixed(1)} A ${distPx.toFixed(1)} ${distPx.toFixed(1)} 0 ${large} ${sweep} ${pxx2.toFixed(1)} ${pyy2.toFixed(1)} Z`;
+             svgElements += tag('path', {d: dFull, fill: fillColor, 'fill-opacity': fillOpacity, stroke: strokeColor, 'stroke-width':2});
+             
+             let midAng = startAng + Math.abs(diff) / 2;
+             if (!ang.isInner) midAng += Math.PI;
+             let bx = Math.cos(midAng);
+             let by = Math.sin(midAng);
+             
+             const labelPxX = pxC + bx * (distPx + (ang.val === '?' ? 34 : 26));
+             const labelPxY = pyC + by * (distPx + (ang.val === '?' ? 34 : 26));
+             
+             let displayVal = ang.val;
+             if (displayVal === '?') {
+                 svgElements += tag('text', {x:labelPxX.toFixed(1), y:labelPxY.toFixed(1), fill:strokeColor, 'text-anchor':'middle', 'dominant-baseline':'middle', 'font-family':'Nunito, sans-serif', 'font-size':'30px', 'font-weight':'bold', 'font-style':'italic'}, '?');
+             } else if (displayVal.match(/^[0-9]+$/)) {
+                 svgElements += textNodePx(labelPxX, labelPxY, `${displayVal}°`, 'middle', 'middle', strokeColor, '18px');
+             } else {
+                 svgElements += textNodePx(labelPxX, labelPxY, displayVal, 'middle', 'middle', strokeColor, '18px');
+             }
+          }
+
+          const sweepAngle = ang.isInner ? Math.abs(diff) : (2 * Math.PI - Math.abs(diff));
+          angleSectorObstacles.push({
+             type: 'angle-sector',
+             cx: pxC,
+             cy: pyC,
+             startAng: startAng,
+             sweepAngle: sweepAngle,
+             r: distPx
+          });
+        }
+      });
+
+      // --- ОСНОВНЫЕ ТОЧКИ ---
+      // Auto-add points if user specifically set 'hollow' or 'filled' but they didn't exist
+      [...(config.hollowPoints || []), ...(config.filledPoints || [])].forEach(name => {
+         if (!config.pointByName[name]) {
+            const newPt = { x: 0, y: 0, name: name };
+            config.pointByName[name] = newPt;
+            config.allPoints.push(newPt);
+         } else {
+            const existingPt = config.pointByName[name];
+            if (!config.allPoints.some(p => p.name === name)) {
+                config.allPoints.push(existingPt);
+            }
+         }
+      });
+
+      // Gather obstacles for label placement
+      const pointDupIdx = new Map();
+      const coordCounts = {};
+      config.allPoints.forEach(p => {
+         const key = p.x.toFixed(6) + '_' + p.y.toFixed(6);
+         const count = coordCounts[key] || 0;
+         coordCounts[key] = count + 1;
+         pointDupIdx.set(p, count);
+      });
+
+      function getPtPx(p) {
+         const screenX = mapX(p.x);
+         const screenY = mapY(p.y);
+         return {
+            x: screenX,
+            y: screenY
+         };
+      }
+
+      const obstacles = [];
+      angleSectorObstacles.forEach(o => obstacles.push(o));
+      function addLineObstacle(p1, p2) {
+         if (!p1 || !p2) return;
+         obstacles.push({type:'line', x1:mapX(p1.x), y1:mapY(p1.y), x2:mapX(p2.x), y2:mapY(p2.y)});
+      }
+      if (config.axisX) obstacles.push({type:'line', isAxis: true, x1:mapX(mathLeft), y1:mapY(0), x2:mapX(mathRight), y2:mapY(0)});
+      if (config.axisY) obstacles.push({type:'line', isAxis: true, x1:mapX(0), y1:mapY(mathBottom), x2:mapX(0), y2:mapY(mathTop)});
+      
+      if (config.drawMainLine) {
+         for (let i=0; i<config.mainSequence.length-1; i++) addLineObstacle(config.mainSequence[i], config.mainSequence[i+1]);
+         if (config.mainSequence.length > 2) addLineObstacle(config.mainSequence[config.mainSequence.length-1], config.mainSequence[0]);
+      }
+      
+      config.extraLines.forEach(l => {
+         addLineObstacle(config.pointByName[l.charAt(0)], config.pointByName[l.charAt(1)]);
+      });
+      config.segments.forEach(seg => addLineObstacle(config.pointByName[seg.name.charAt(0)], config.pointByName[seg.name.charAt(1)]));
+
+      config.allPoints.forEach(p => {
+         const ptPx = getPtPx(p);
+         obstacles.push({type:'box', x: ptPx.x, y: ptPx.y, w: 14, h: 14});
+      });
+
+      config.hatching.forEach(h => {
+         let p1 = config.pointByName[h.from]; let p2 = config.pointByName[h.to];
+         let yH = p1 ? p1.y : (p2 ? p2.y : 0);
+         const canvasW = mathRight - mathLeft;
+         let x1 = h.from === '-inf' ? mathLeft - canvasW : (p1 ? p1.x : parseFloat(h.from));
+         let x2 = h.to === '+inf' ? mathRight + canvasW : (p2 ? p2.x : parseFloat(h.to));
+         if (x1 > x2) { let t = x1; x1 = x2; x2 = t; }
+         obstacles.push({type:'box', x: (mapX(x1)+mapX(x2))/2, y: mapY(yH) - 13, w: Math.abs(mapX(x2)-mapX(x1))+40, h: 30});
+      });
+      
+      config.tickMarks.forEach(t => {
+         obstacles.push({type:'box', x: mapX(t.x), y: mapY(t.y) + 16, w: 20, h: 20});
+      });
+
+      // Add circle outlines as obstacles to avoid overlap
+      if (config.circDataInscribed && config.inscribedVisible !== false) {
+         obstacles.push({
+            type: 'circle-outline',
+            cx: mapX(config.circDataInscribed.cx),
+            cy: mapY(config.circDataInscribed.cy),
+            r: config.circDataInscribed.r * scale
+         });
+      }
+      if (config.circDataCircumscribed && config.circumscribedVisible !== false) {
+         obstacles.push({
+            type: 'circle-outline',
+            cx: mapX(config.circDataCircumscribed.cx),
+            cy: mapY(config.circDataCircumscribed.cy),
+            r: config.circDataCircumscribed.r * scale
+         });
+      }
+      if (circData && config.circle && config.circle.visible) {
+         obstacles.push({
+            type: 'circle-outline',
+            cx: mapX(circData.cx),
+            cy: mapY(circData.cy),
+            r: circData.r * scale
+         });
+      }
+
+      function placeSmartLabel(p) {
+           const ptPx = getPtPx(p);
+           const px = ptPx.x;
+           const py = ptPx.y;
+           let str = p.name;
+           if (str.match(/^-?[A-Za-z0-9_]+$/)) str = '$' + str + '$';
+           
+           const w = 24; const h = 24;
+           const offsets = [
+              {dx: 0, dy: -20}, // top
+              {dx: 18, dy: -18},// top-right
+              {dx: -18, dy: -18},// top-left
+              {dx: 0, dy: 22},  // bottom
+              {dx: 18, dy: 18}, // bottom-right
+              {dx: -18, dy: 18},// bottom-left
+              {dx: 24, dy: 0},  // right
+              {dx: -24, dy: 0}, // left
+           ];
+           
+           let startIdx = 0;
+           const dupIdx = pointDupIdx.get(p) || 0;
+           if (dupIdx > 0) {
+              startIdx = 0; // stack labels upwards above the stacked point
+           } else {
+              let hasHatching = config.hatching && config.hatching.length > 0;
+              if (hasHatching && Math.abs(p.y) < 0.01) {
+                 startIdx = 3; // start from bottom
+              } else if (config.axisX && Math.abs(p.y) < 0.01) {
+                 startIdx = 3; // points on axis X should preferably go bottom
+              } else if (config.axisY && Math.abs(p.x) < 0.01) {
+                 startIdx = 6; // points on axis Y should preferably go right
+              }
+           }
+
+           function check(cx, cy) {
+              for (const o of obstacles) {
+                 if (o.type === 'box') {
+                    // Игнорируем собственную точку (dot на координате графически смещенного центра)
+                    if (Math.abs(o.x - px) < 1 && Math.abs(o.y - py) < 1 && o.w === 14 && o.h === 14) {
+                       continue;
+                    }
+                    if (Math.abs(cx - o.x) * 2 < (w + o.w) && Math.abs(cy - o.y) * 2 < (h + o.h)) return true;
+                 } else if (o.type === 'line') {
+                    if (o.isAxis) {
+                       continue;
+                    }
+                    const l2 = (o.x2 - o.x1)**2 + (o.y2 - o.y1)**2;
+                    let t = l2 === 0 ? 0 : ((cx - o.x1)*(o.x2 - o.x1) + (cy - o.y1)*(o.y2 - o.y1)) / l2;
+                    t = Math.max(0, Math.min(1, t));
+                    const projX = o.x1 + t * (o.x2 - o.x1);
+                    const projY = o.y1 + t * (o.y2 - o.y1);
+                    if ((cx - projX)**2 + (cy - projY)**2 < 12 * 12) return true; // 12px radius from text center
+                  } else if (o.type === 'circle-outline') {
+                     const dist = Math.sqrt((cx - o.cx)**2 + (cy - o.cy)**2);
+                     if (Math.abs(dist - o.r) < 14) return true; // Keep center of text at least 14px away from circle line
+                 } else if (o.type === 'angle-sector') {
+                     const dx = cx - o.cx;
+                     const dy = cy - o.cy;
+                     const dist = Math.hypot(dx, dy);
+                     if (dist < o.r + 16) {
+                        const a = Math.atan2(dy, dx);
+                        let rel = a - o.startAng;
+                        while (rel < 0) rel += 2 * Math.PI;
+                        while (rel >= 2 * Math.PI) rel -= 2 * Math.PI;
+                        if (rel <= o.sweepAngle) return true;
+                     }
+                 }
+              }
+              return false;
+           }
+
+           let bestIdx = startIdx;
+           for(let i=0; i<offsets.length; i++) {
+              let idx = (startIdx + i) % offsets.length;
+              let off = offsets[idx];
+              let cx = px + off.dx;
+              let cy = py + off.dy;
+              if (!check(cx, cy)) { bestIdx = idx; break; }
+           }
+           let best = offsets[bestIdx];
+           
+           let finalCx = px + best.dx;
+           let finalCy = py + best.dy;
+           obstacles.push({type:'box', x:finalCx, y:finalCy, w: 26, h: 26});
+
+           return mathNodePx(finalCx, finalCy, str, 'middle', 'middle', THEME.text);
+      }
+
+      config.allPoints.forEach(p => {
+        if (config.pointsInvisibleAll) return;
+        if (config.invisiblePoints && config.invisiblePoints.includes(p.name)) return;
+        
+        let isHollow = false;
+        if (config.hollowPoints && config.hollowPoints.includes(p.name)) isHollow = true;
+        if (config.filledPoints && config.filledPoints.includes(p.name)) isHollow = false;
+        
+        const ptPx = getPtPx(p);
+        if (isHollow) {
+          svgElements += tag('circle', {cx: ptPx.x.toFixed(1), cy: ptPx.y.toFixed(1), r: 7.5, fill: THEME.bg, stroke: THEME.point, 'stroke-width': 3});
+        } else {
+          svgElements += tag('circle', {cx: ptPx.x.toFixed(1), cy: ptPx.y.toFixed(1), r: 6, fill: THEME.point, stroke: 'none', 'stroke-width': 0});
+        }
+        
+        if (p.name && !p.hideLabel && !p.name.startsWith('_dynamic')) {
+          if (!config.invisibleLabelPoints || !config.invisibleLabelPoints.includes(p.name)) {
+             svgElements += placeSmartLabel(p);
+          }
+        }
+      });
+
+      return {
+          html: `<svg width="100%" height="100%" viewBox="0 0 ${W} ${H}" style="display:block; user-select: none;">${svgElements}</svg>`,
+          W: W,
+          H: H
+      };
+    }
+  };
+
+  global.FiveCoreGraph = FiveCoreGraph;
+
+})(typeof window !== 'undefined' ? window : this);
