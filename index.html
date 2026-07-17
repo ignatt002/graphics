@@ -1,3 +1,41 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Графический Движок (FiveCore)</title>
+    <style>
+        /* Делаем так, чтобы график занимал всё окно без прокруток */
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #ffffff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #graph-container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Контейнер, внутри которого движок будет рисовать график -->
+    <div id="graph-container"></div>
+
+    <script>
+        // ==========================================
+        // ШАГ А: ВСТАВЬТЕ СЮДА ВЕСЬ КОД ИЗ graph-engine.js
+        // (прямо под этой строкой вставьте весь текст вашего скрипта)
+        // ==========================================
 /**
  * FiveCore Graph Engine (Core)
  * ----------------------------
@@ -1867,3 +1905,45 @@
   global.FiveCoreGraph = FiveCoreGraph;
 
 })(typeof window !== 'undefined' ? window : this);
+        
+        // ==========================================
+        // КОНЕЦ КОДА ДВИЖКА
+        // ==========================================
+    </script>
+
+    <script>
+        // ШАГ Б: Код для связи с вашим конструктором на Google Сайтах
+        const container = document.getElementById('graph-container');
+        let currentDestroy = null;
+
+        // Слушаем команды от конструктора
+        window.addEventListener('message', function(event) {
+            // Проверяем, что пришло нужное сообщение с командами
+            if (event.data && event.data.type === 'render') {
+                
+                // Очищаем предыдущий график, если он был отрисован
+                if (currentDestroy) {
+                    currentDestroy();
+                    currentDestroy = null;
+                }
+                container.innerHTML = '';
+
+                try {
+                    // Отрисовываем новый график по полученным командам
+                    // event.data.commands — это строка команд на английском (например: "grid: true\npoint A: 1;1")
+                    const result = FiveCoreGraph.render(container, event.data.commands);
+                    
+                    if (result && typeof result.destroy === 'function') {
+                        currentDestroy = result.destroy;
+                    }
+                } catch (err) {
+                    console.error("Ошибка при отрисовке:", err);
+                    container.innerHTML = `<div style="color: red; padding: 20px; font-family: sans-serif;">
+                        Ошибка отрисовки: ${err.message}
+                    </div>`;
+                }
+            }
+        });
+    </script>
+</body>
+</html>
