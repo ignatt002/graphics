@@ -1747,7 +1747,7 @@
          let x1 = h.from === '-inf' ? mathLeft - canvasW : (p1 ? p1.x : parseFloat(h.from));
          let x2 = h.to === '+inf' ? mathRight + canvasW : (p2 ? p2.x : parseFloat(h.to));
          if (x1 > x2) { let t = x1; x1 = x2; x2 = t; }
-         obstacles.push({type:'box', x: (mapX(x1)+mapX(x2))/2, y: mapY(yH) - 13, w: Math.abs(mapX(x2)-mapX(x1))+40, h: 30});
+         obstacles.push({type:'box', isHatching: true, x: (mapX(x1)+mapX(x2))/2, y: mapY(yH) - 13, w: Math.abs(mapX(x2)-mapX(x1))+40, h: 30});
       });
       
       config.tickMarks.forEach(t => {
@@ -1788,7 +1788,15 @@
            if (str.match(/^-?[A-Za-z0-9_]+$/)) str = '$' + str + '$';
            
            const w = 24; const h = 24;
-           const offsets = [
+           const isZeroY = Math.abs(p.y) < 0.01;
+           const offsets = isZeroY ? [
+              {dx: 0, dy: -20},   // top
+              {dx: 16, dy: -20},  // top-right
+              {dx: -16, dy: -20}, // top-left
+              {dx: 0, dy: -36},   // higher top
+              {dx: 16, dy: -36},  // higher top-right
+              {dx: -16, dy: -36}  // higher top-left
+           ] : [
               {dx: 0, dy: -20}, // top
               {dx: 18, dy: -18},// top-right
               {dx: -18, dy: -18},// top-left
@@ -1803,15 +1811,10 @@
            const dupIdx = pointDupIdx.get(p) || 0;
            if (dupIdx > 0) {
               startIdx = 0; // stack labels upwards above the stacked point
-           } else {
-              let hasHatching = config.hatching && config.hatching.length > 0;
-              if (hasHatching && Math.abs(p.y) < 0.01) {
-                 startIdx = 3; // start from bottom
-              } else if (config.axisX && Math.abs(p.y) < 0.01) {
-                 startIdx = 3; // points on axis X should preferably go bottom
-              } else if (config.axisY && Math.abs(p.x) < 0.01) {
-                 startIdx = 6; // points on axis Y should preferably go right
-              }
+           } else if (isZeroY) {
+              startIdx = 0; // точки на высоте y=0 (координатная прямая) пишутся строго сверху
+           } else if (config.axisY && Math.abs(p.x) < 0.01) {
+              startIdx = 6; // points on axis Y should preferably go right
            }
 
            function check(cx, cy) {
@@ -1819,6 +1822,10 @@
                  if (o.type === 'box') {
                     // Игнорируем собственную точку (dot на координате графически смещенного центра)
                     if (Math.abs(o.x - px) < 1 && Math.abs(o.y - py) < 1 && o.w === 14 && o.h === 14) {
+                       continue;
+                    }
+                    // Для точек на y=0 штриховка не должна выталкивать название точки
+                    if (isZeroY && o.isHatching) {
                        continue;
                     }
                     if (Math.abs(cx - o.x) * 2 < (w + o.w) && Math.abs(cy - o.y) * 2 < (h + o.h)) return true;
@@ -1863,6 +1870,7 @@
            
            let finalCx = px + best.dx;
            let finalCy = py + best.dy;
+           if (dupIdx > 0 && isZeroY) finalCy -= dupIdx * 20;
            obstacles.push({type:'box', x:finalCx, y:finalCy, w: 26, h: 26});
 
            return mathNodePx(finalCx, finalCy, str, 'middle', 'middle', THEME.text);
