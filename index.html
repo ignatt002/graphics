@@ -31,7 +31,7 @@
     <div id="graph-container"></div>
 
     <script>
-/* ВСТАВЬ СЮДА КОД ИЗ GRAPH-ENGINE.JS */
+
 /**
  * FiveCore Graph Engine (Core)
  * ----------------------------
@@ -66,6 +66,8 @@
  * - chord DEG1: DEG2
  * - circle_inscribed: true
  * - circle_circumscribed: true
+ * - line[.color]: X1;Y1 X2;Y2 [X3;Y3 ...]
+ * - dashed_line[.color]: X1;Y1 X2;Y2 [X3;Y3 ...]
  */
 
 (function (global) {
@@ -73,7 +75,7 @@
     accent: '#1CB0F6',
     grid: '#e5e5e5',
     axis: '#a0a0a0',
-    axisText: '#888888',
+    axisText: '#AFAFAF',
     text: '#4b4b4b',
     point: '#1CB0F6',
     bg: '#ffffff'
@@ -195,8 +197,133 @@
         diameterInfinite: false, radiusInfinite: false,
         invisiblePoints: [], invisibleLabelPoints: [], hollowPoints: [], filledPoints: [], tickMarks: [], hatching: [],
         onLinePoints: [],
-        equations: []
+        equations: [],
+        texts: [],
+        freeLines: []
       };
+
+      function parseFreeLine(line) {
+        if (!line) return null;
+        const m = line.match(/^[\s]*(линия|line|polyline|пунктир|dashed_line|dash_line|dotted_line)(?:\.([A-Za-zА-Яа-яЁё0-9#]+))?\s*:\s*(.+)$/i);
+        if (!m) return null;
+
+        const cmdType = m[1].toLowerCase();
+        const isDashed = cmdType === 'пунктир' || cmdType === 'dashed_line' || cmdType === 'dash_line' || cmdType === 'dotted_line';
+        const colorToken = m[2] ? m[2].toLowerCase() : null;
+        const coordsStr = m[3].trim();
+
+        const points = [];
+        const regex = /(-?\d+(?:[.,]\d+)?)\s*;\s*(-?\d+(?:[.,]\d+)?)/g;
+        let match;
+        while ((match = regex.exec(coordsStr)) !== null) {
+          const x = parseFloat(match[1].replace(',', '.'));
+          const y = parseFloat(match[2].replace(',', '.'));
+          if (!isNaN(x) && !isNaN(y)) {
+            points.push({ x, y });
+          }
+        }
+
+        if (points.length < 2) return null;
+
+        const colorMap = {
+          'ж': '#facc15', 'y': '#facc15', 'желтый': '#facc15', 'жёлтый': '#facc15', 'yellow': '#facc15',
+          'к': '#fb7185', 'r': '#fb7185', 'красный': '#fb7185', 'red': '#fb7185',
+          'з': '#4ade80', 'g': '#4ade80', 'зеленый': '#4ade80', 'зелёный': '#4ade80', 'green': '#4ade80',
+          'с': '#60a5fa', 'b': '#60a5fa', 'синий': '#60a5fa', 'blue': '#60a5fa',
+          'г': '#38bdf8', 'c': '#38bdf8', 'голубой': '#38bdf8', 'cyan': '#38bdf8',
+          'сер': '#AFAFAF', 'серый': '#AFAFAF', 'gray': '#AFAFAF', 'grey': '#AFAFAF'
+        };
+
+        let color = null;
+        if (colorToken) {
+          if (colorMap[colorToken]) color = colorMap[colorToken];
+          else if (/^#[0-9a-f]{3,8}$/i.test(colorToken)) color = colorToken;
+        }
+
+        if (!color) {
+          color = isDashed ? THEME.text : THEME.accent;
+        }
+
+        return {
+          points,
+          dashed: isDashed,
+          color,
+          colorCode: colorToken,
+          strokeWidth: isDashed ? 2 : 3,
+          dashArray: isDashed ? '5,5' : ''
+        };
+      }
+
+      function parseTextLine(line) {
+        if (!line || !/^[\s]*(?:текст|text)[.:\s]/i.test(line)) return null;
+        const colonIdx = line.indexOf(':');
+        if (colonIdx === -1) return null;
+        const header = line.substring(0, colonIdx).trim();
+        const content = line.substring(colonIdx + 1).trim();
+
+        let rest = header.replace(/^[\s]*(?:текст|text)\.?/i, '').trim();
+
+        const coordMatch = rest.match(/(-?\d+(?:[.,]\d+)?)\s*;\s*(-?\d+(?:[.,]\d+)?)/);
+        if (!coordMatch) return null;
+
+        const x = parseFloat(coordMatch[1].replace(',', '.'));
+        const y = parseFloat(coordMatch[2].replace(',', '.'));
+        rest = rest.replace(coordMatch[0], '');
+
+        const tokens = rest.split(/[.\s]+/).map(t => t.trim()).filter(Boolean);
+
+        let color = '#AFAFAF'; // default text color (#AFAFAF)
+        let colorCode = null;
+        let align = 'middle';
+        let fieldWidth = null;
+        let fontSize = 14;
+
+        const colorMap = {
+          'ж': '#facc15', 'y': '#facc15',
+          'к': '#fb7185', 'r': '#fb7185',
+          'з': '#4ade80', 'g': '#4ade80',
+          'с': '#60a5fa', 'b': '#60a5fa',
+          'г': '#38bdf8', 'c': '#38bdf8',
+          'сер': '#AFAFAF', 'серый': '#AFAFAF', 'gray': '#AFAFAF', 'grey': '#AFAFAF'
+        };
+
+        tokens.forEach(tok => {
+          const t = tok.toLowerCase();
+          const fMatch = t.match(/^(?:поле|field|w|width)\s*(\d+(?:[.,]\d+)?)$/i);
+          if (fMatch) {
+            fieldWidth = parseFloat(fMatch[1].replace(',', '.'));
+            return;
+          }
+          const sMatch = t.match(/^(?:размер|size|кегль|font)\s*(\d+(?:[.,]\d+)?)$/i);
+          if (sMatch) {
+            fontSize = parseFloat(sMatch[1].replace(',', '.'));
+            return;
+          }
+          if (t === 'лево' || t === 'слева' || t === 'left' || t === 'start') {
+            align = 'start';
+            return;
+          }
+          if (t === 'право' || t === 'справа' || t === 'right' || t === 'end') {
+            align = 'end';
+            return;
+          }
+          if (t === 'середина' || t === 'посередине' || t === 'центр' || t === 'center' || t === 'middle') {
+            align = 'middle';
+            return;
+          }
+          if (colorMap[t]) {
+            color = colorMap[t];
+            colorCode = t;
+            return;
+          }
+          if (/^#[0-9a-f]{3,8}$/i.test(t)) {
+            color = t;
+            return;
+          }
+        });
+
+        return { x, y, color, colorCode, align, fieldWidth, fontSize, text: content };
+      }
 
       const lines = str.split('\n').filter(l => l.trim().length > 0);
 
@@ -373,9 +500,13 @@
             const match = line.match(/^point_extra\s+([^:]+):\s*(-?[\d.]+)[;:,]\s*(-?[\d.]+)/i);
             if (match) addNamedPoint(match[1].trim(), parseFloat(match[2]), parseFloat(match[3]), false);
         }
-        else if (lower === 'main_line: true') { config.drawMainLine = true; }
+        else if (lower === 'main_line: true' || lower === 'линия') { config.drawMainLine = true; }
         else if (lower.startsWith('line_extra ')) {
             config.extraLines.push(line.substring(11).trim());
+        }
+        else if (/^(?:линия|line|polyline|пунктир|dashed_line|dash_line|dotted_line)/i.test(line)) {
+            const fl = parseFreeLine(line);
+            if (fl) config.freeLines.push(fl);
         }
         else if (lower.startsWith('angle_inner ') || lower.startsWith('angle_outer ')) {
             const isInner = lower.startsWith('angle_inner');
@@ -500,6 +631,10 @@
                     config.pointByName[name] = { x, y, name };
                 }
             }
+        }
+        else if (lower.startsWith('текст') || lower.startsWith('text')) {
+            const parsed = parseTextLine(line);
+            if (parsed) config.texts.push(parsed);
         }
         else if (lower.startsWith('graph_equation:')) {
             let eq = line.substring(15).trim();
@@ -775,6 +910,16 @@
       if (config.tickMarks.length > 0) {
         config.tickMarks.forEach(t => expandBounds(t.x, t.y));
       }
+
+      if (config.texts && config.texts.length > 0) {
+        config.texts.forEach(t => expandBounds(t.x, t.y));
+      }
+
+      if (config.freeLines && config.freeLines.length > 0) {
+        config.freeLines.forEach(fl => {
+          fl.points.forEach(p => expandBounds(p.x, p.y));
+        });
+      }
       
       if (circData) {
         expandBounds(circData.cx - circData.r, circData.cy - circData.r);
@@ -1044,25 +1189,77 @@
       
       computeScale(minX, maxX, minY, maxY, true);
 
-      // Smart bounds expansion for labels
-      let expanded = false;
-      let nextMinX = minX, nextMaxX = maxX, nextMinY = minY, nextMaxY = maxY;
-      
-      config.allPoints.forEach(p => {
-          if (p.name && !p.hideLabel && !p.name.startsWith('_dynamic')) {
-             let px = offsetX + (p.x - minX) * scale;
-             let py = offsetY + (maxY - p.y) * scale;
-             // Require 40px safe space from the boundary for labeled points
-             if (px < 40) { nextMinX -= (40 - px) / scale; expanded = true; }
-             if (px > W - 40) { nextMaxX += (px - (W - 40)) / scale; expanded = true; }
-             if (py < 40) { nextMaxY += (40 - py) / scale; expanded = true; }
-             if (py > H - 40) { nextMinY -= (py - (H - 40)) / scale; expanded = true; }
-          }
-      });
+      // Smart bounds expansion for point labels and custom text elements
+      for (let pass = 0; pass < 3; pass++) {
+        let expanded = false;
+        let nextMinX = minX, nextMaxX = maxX, nextMinY = minY, nextMaxY = maxY;
+        
+        config.allPoints.forEach(p => {
+            if (p.name && !p.hideLabel && !p.name.startsWith('_dynamic')) {
+               let px = offsetX + (p.x - minX) * scale;
+               let py = offsetY + (maxY - p.y) * scale;
+               // Require 40px safe space from the boundary for labeled points
+               if (px < 40) { nextMinX -= (40 - px) / scale; expanded = true; }
+               if (px > W - 40) { nextMaxX += (px - (W - 40)) / scale; expanded = true; }
+               if (py < 40) { nextMaxY += (40 - py) / scale; expanded = true; }
+               if (py > H - 40) { nextMinY -= (py - (H - 40)) / scale; expanded = true; }
+            }
+        });
 
-      if (expanded) {
-          minX = nextMinX; maxX = nextMaxX; minY = nextMinY; maxY = nextMaxY;
-          computeScale(minX, maxX, minY, maxY, true);
+        // Ensure comfortable margin on sides where custom text is located
+        if (config.texts && config.texts.length > 0) {
+           const padSide = 40; // Indent / margin from the edges of the composition
+           config.texts.forEach(item => {
+              const px = offsetX + (item.x - minX) * scale;
+              const py = offsetY + (maxY - item.y) * scale;
+              const fontSize = item.fontSize || 14;
+              const align = item.align || 'middle';
+              const rawText = item.text || '';
+              const cleanTextForLength = rawText
+                .replace(/\\{2}(серый|сер|gray|grey|[гжкзсycrgb])\s*/gi, '')
+                .replace(/\\{2}\s*/g, '');
+              const lines = cleanTextForLength.split('\n');
+
+              let fieldPx;
+              if (item.fieldWidth != null) {
+                 fieldPx = item.fieldWidth <= 80 ? Math.round(item.fieldWidth * (fontSize * 0.62)) : Math.round(item.fieldWidth);
+              } else {
+                 const maxLineLen = Math.max(...lines.map(l => l.length), 1);
+                 fieldPx = Math.max(25, maxLineLen * (fontSize * 0.68));
+              }
+
+              let leftPx, rightPx;
+              if (align === 'start' || align === 'left') {
+                 leftPx = px;
+                 rightPx = px + fieldPx;
+              } else if (align === 'end' || align === 'right') {
+                 leftPx = px - fieldPx;
+                 rightPx = px;
+              } else {
+                 leftPx = px - fieldPx / 2;
+                 rightPx = px + fieldPx / 2;
+              }
+
+              const charsPerLine = item.fieldWidth != null ? (item.fieldWidth <= 80 ? item.fieldWidth : Math.max(1, Math.floor(fieldPx / (fontSize * 0.62)))) : Math.max(1, cleanTextForLength.length);
+              const lineCount = Math.max(lines.length, Math.ceil((cleanTextForLength.length || 1) / charsPerLine));
+              const approxHeight = Math.max(fontSize * 1.3, lineCount * fontSize * 1.35);
+
+              const topPx = py - approxHeight / 2;
+              const bottomPx = py + approxHeight / 2;
+
+              if (leftPx < padSide) { nextMinX -= (padSide - leftPx) / scale; expanded = true; }
+              if (rightPx > W - padSide) { nextMaxX += (rightPx - (W - padSide)) / scale; expanded = true; }
+              if (topPx < padSide) { nextMaxY += (padSide - topPx) / scale; expanded = true; }
+              if (bottomPx > H - padSide) { nextMinY -= (bottomPx - (H - padSide)) / scale; expanded = true; }
+           });
+        }
+
+        if (expanded) {
+            minX = nextMinX; maxX = nextMaxX; minY = nextMinY; maxY = nextMaxY;
+            computeScale(minX, maxX, minY, maxY, true);
+        } else {
+            break;
+        }
       }
 
       function mapX(x) { return offsetX + (x - minX) * scale; }
@@ -1359,6 +1556,30 @@
         const p2 = config.pointByName[lName.charAt(1)];
         if (p1 && p2) svgElements += lineStr(p1.x, p1.y, p2.x, p2.y, THEME.accent, 3);
       });
+
+      // --- СВОБОДНЫЕ ЛИНИИ И ПУНКТИРЫ (ЛИНИЯ / ПУНКТИР) ---
+      if (config.freeLines && config.freeLines.length > 0) {
+        config.freeLines.forEach(fl => {
+          if (!fl.points || fl.points.length < 2) return;
+          let d = `M ${mapX(fl.points[0].x).toFixed(1)} ${mapY(fl.points[0].y).toFixed(1)}`;
+          for (let i = 1; i < fl.points.length; i++) {
+            d += ` L ${mapX(fl.points[i].x).toFixed(1)} ${mapY(fl.points[i].y).toFixed(1)}`;
+          }
+          const strokeWidth = fl.strokeWidth || (fl.dashed ? 2 : 3);
+          const strokeDash = fl.dashed ? (fl.dashArray || '5,5') : '';
+          const strokeColor = fl.color || (fl.dashed ? THEME.text : THEME.accent);
+
+          svgElements += tag('path', {
+            d,
+            fill: 'none',
+            stroke: strokeColor,
+            'stroke-width': strokeWidth,
+            'stroke-dasharray': strokeDash,
+            'stroke-linecap': 'round',
+            'stroke-linejoin': 'round'
+          });
+        });
+      }
 
       // --- ПОДПИСИ ОТРЕЗКОВ ---
       let figureCx = 0, figureCy = 0;
@@ -1735,6 +1956,20 @@
       });
       config.segments.forEach(seg => addLineObstacle(config.pointByName[seg.name.charAt(0)], config.pointByName[seg.name.charAt(1)]));
 
+      if (config.freeLines) {
+         config.freeLines.forEach(fl => {
+            for (let i = 0; i < fl.points.length - 1; i++) {
+               obstacles.push({
+                  type: 'line',
+                  x1: mapX(fl.points[i].x),
+                  y1: mapY(fl.points[i].y),
+                  x2: mapX(fl.points[i + 1].x),
+                  y2: mapY(fl.points[i + 1].y)
+               });
+            }
+         });
+      }
+
       config.allPoints.forEach(p => {
          const ptPx = getPtPx(p);
          obstacles.push({type:'box', x: ptPx.x, y: ptPx.y, w: 14, h: 14});
@@ -1753,6 +1988,21 @@
       config.tickMarks.forEach(t => {
          obstacles.push({type:'box', x: mapX(t.x), y: mapY(t.y) + 16, w: 20, h: 20});
       });
+
+      if (config.texts && config.texts.length > 0) {
+         config.texts.forEach(t => {
+            const px = mapX(t.x);
+            const py = mapY(t.y);
+            const w = t.fieldWidth ? (t.fieldWidth <= 80 ? t.fieldWidth * 8.5 : t.fieldWidth) : ((t.text ? t.text.length : 5) * 8.5);
+            obstacles.push({
+               type: 'box',
+               x: t.align === 'start' ? px + w/2 : (t.align === 'end' ? px - w/2 : px),
+               y: py,
+               w: w,
+               h: 24
+            });
+         });
+      }
 
       // Add circle outlines as obstacles to avoid overlap
       if (config.circDataInscribed && config.inscribedVisible !== false) {
@@ -1897,6 +2147,106 @@
           }
         }
       });
+
+      if (config.texts && config.texts.length > 0) {
+        const INLINE_COLOR_MAP = {
+          'г': '#38bdf8', 'c': '#38bdf8',
+          'ж': '#facc15', 'y': '#facc15',
+          'к': '#fb7185', 'r': '#fb7185',
+          'з': '#4ade80', 'g': '#4ade80',
+          'с': '#60a5fa', 'b': '#60a5fa',
+          'сер': '#AFAFAF', 'серый': '#AFAFAF', 'gray': '#AFAFAF', 'grey': '#AFAFAF'
+        };
+        const inlineColorRegex = /\\{2}(серый|сер|gray|grey|[гжкзсycrgb])\s*([\s\S]+?)\s*\\{2}(?:\1|(?=[^a-zа-яё]|$))/gi;
+
+        config.texts.forEach(item => {
+          const px = mapX(item.x);
+          const py = mapY(item.y);
+          const fontSize = item.fontSize || 14;
+          const col = item.color || '#AFAFAF';
+          const align = item.align || 'middle';
+
+          let rawText = item.text || '';
+          const hasKatex = typeof window !== 'undefined' && window.katex && rawText.includes('$');
+          const hasInlineColor = /\\{2}(серый|сер|gray|grey|[гжкзсycrgb])\s*[\s\S]+?\s*\\{2}(?:\1|(?=[^a-zа-яё]|$))/i.test(rawText);
+
+          let renderedHtml = rawText;
+          if (hasKatex) {
+            renderedHtml = rawText.replace(/\$([^$]+)\$/g, (m, expr) => {
+              try {
+                return window.katex.renderToString(expr.trim(), { throwOnError: false });
+              } catch (e) {
+                return m;
+              }
+            });
+          } else {
+            renderedHtml = rawText
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;');
+          }
+
+          if (hasInlineColor) {
+            renderedHtml = renderedHtml.replace(inlineColorRegex, (match, tag, inner) => {
+              const hCol = INLINE_COLOR_MAP[tag.toLowerCase()] || '#AFAFAF';
+              return `<span style="color:${hCol};">${inner}</span>`;
+            });
+          }
+
+          const cleanTextForLength = rawText
+            .replace(/\\{2}(серый|сер|gray|grey|[гжкзсycrgb])\s*/gi, '')
+            .replace(/\\{2}\s*/g, '');
+
+          if (item.fieldWidth != null || hasKatex || hasInlineColor || rawText.includes('\n')) {
+            let fieldPx;
+            if (item.fieldWidth != null) {
+              fieldPx = item.fieldWidth <= 80 ? Math.round(item.fieldWidth * (fontSize * 0.62)) : Math.round(item.fieldWidth);
+            } else {
+              fieldPx = Math.max(120, Math.min(W - 40, (cleanTextForLength.length + 4) * (fontSize * 0.65)));
+            }
+
+            let boxX = px;
+            let tAlign = 'center';
+            if (align === 'start' || align === 'left') {
+              boxX = px;
+              tAlign = 'left';
+            } else if (align === 'end' || align === 'right') {
+              boxX = px - fieldPx;
+              tAlign = 'right';
+            } else {
+              boxX = px - fieldPx / 2;
+              tAlign = 'center';
+            }
+
+            const charsPerLine = item.fieldWidth != null ? (item.fieldWidth <= 80 ? item.fieldWidth : Math.max(1, Math.floor(fieldPx / (fontSize * 0.62)))) : Math.max(1, cleanTextForLength.length);
+            const lineCount = Math.max(1, Math.ceil((cleanTextForLength.length || 1) / charsPerLine));
+            const approxHeight = Math.max(fontSize * 1.3, lineCount * fontSize * 1.35);
+            const boxY = py - (approxHeight / 2);
+            const boxH = Math.max(approxHeight + 30, 80);
+
+            svgElements += tag('foreignObject', {
+              x: boxX.toFixed(1),
+              y: boxY.toFixed(1),
+              width: fieldPx.toFixed(1),
+              height: boxH.toFixed(1),
+              style: 'overflow: visible; pointer-events: none;'
+            }, `<div xmlns="http://www.w3.org/1999/xhtml" style="width:${fieldPx}px;color:${col};font-family:'Nunito',sans-serif;font-size:${fontSize}px;font-weight:700;text-align:${tAlign};line-height:1.25;word-wrap:break-word;overflow-wrap:break-word;white-space:normal;">${renderedHtml}</div>`);
+          } else {
+            let svgAnchor = 'middle';
+            if (align === 'start' || align === 'left') svgAnchor = 'start';
+            else if (align === 'end' || align === 'right') svgAnchor = 'end';
+
+            svgElements += tag('text', {
+              x: px.toFixed(1),
+              y: py.toFixed(1),
+              fill: col,
+              'text-anchor': svgAnchor,
+              'dominant-baseline': 'central',
+              style: `font-family: 'Nunito', sans-serif; font-size: ${fontSize}px; font-weight: 700;`
+            }, renderedHtml);
+          }
+        });
+      }
 
       return {
           html: `<svg width="100%" height="100%" viewBox="0 0 ${W} ${H}" style="display:block; user-select: none;">${svgElements}</svg>`,
