@@ -68,6 +68,7 @@
  * - circle_circumscribed: true
  * - line[.color]: X1;Y1 X2;Y2 [X3;Y3 ...]
  * - dashed_line[.color]: X1;Y1 X2;Y2 [X3;Y3 ...]
+ * - crop: X1;Y1 X2;Y2 (forced cropping box)
  */
 
 (function (global) {
@@ -199,7 +200,8 @@
         onLinePoints: [],
         equations: [],
         texts: [],
-        freeLines: []
+        freeLines: [],
+        forcedCrop: null
       };
 
       function parseFreeLine(line) {
@@ -484,6 +486,27 @@
         if (!lower) return;
 
         if (lower === 'no_crop') { config.noCrop = true; }
+        else if (lower.startsWith('crop:') || lower.startsWith('forced_crop:') || lower.startsWith('принудительное кадрирование:') || lower.startsWith('принудительное_кадрирование:')) {
+            const rawCoords = line.split(':')[1].trim().replace(/,/g, '.');
+            const regex = /(-?\d+(?:[.,]\d+)?)\s*;\s*(-?\d+(?:[.,]\d+)?)/g;
+            const pts = [];
+            let mPt;
+            while ((mPt = regex.exec(rawCoords)) !== null) {
+              const x = parseFloat(mPt[1]);
+              const y = parseFloat(mPt[2]);
+              if (!isNaN(x) && !isNaN(y)) pts.push({ x, y });
+            }
+            if (pts.length >= 2) {
+              const x1 = pts[0].x, y1 = pts[0].y;
+              const x2 = pts[1].x, y2 = pts[1].y;
+              config.forcedCrop = {
+                minX: Math.min(x1, x2),
+                maxX: Math.max(x1, x2),
+                minY: Math.min(y1, y2),
+                maxY: Math.max(y1, y2)
+              };
+            }
+        }
         else if (lower.startsWith('axis_x:')) { config.axisX = lower.includes('true'); }
         else if (lower.startsWith('axis_y:')) { config.axisY = lower.includes('true'); }
         else if (lower.startsWith('grid:')) { config.grid = lower.includes('true'); }
@@ -1137,7 +1160,14 @@
          }
       }
 
-      if (config.noCrop) {
+      if (config.forcedCrop) {
+         minX = config.forcedCrop.minX;
+         maxX = config.forcedCrop.maxX;
+         minY = config.forcedCrop.minY;
+         maxY = config.forcedCrop.maxY;
+         hasData = true;
+         isEquationBounds = true;
+      } else if (config.noCrop) {
          let maxAbs = 10;
          if (hasData) {
             maxAbs = Math.max(
@@ -1172,13 +1202,13 @@
 
       let scale = 1, offsetX = 0, offsetY = 0;
       function computeScale(cMinX, cMaxX, cMinY, cMaxY, useAutoH=false) {
-         const padding = 20; 
-         const mathWidth = cMaxX - cMinX;
-         const mathHeight = Math.max(cMaxY - cMinY, 0.1);
+         const padding = config.forcedCrop ? 0 : 20; 
+         const mathWidth = Math.max(cMaxX - cMinX, 0.001);
+         const mathHeight = Math.max(cMaxY - cMinY, 0.001);
          const scaleX = (W - padding * 2) / mathWidth;
          
          if (useAutoH && !config.noCrop) {
-             H = Math.min(W, mathHeight * scaleX + padding * 2);
+             H = Math.max(20, Math.round(mathHeight * scaleX + padding * 2));
          }
 
          const scaleY = (H - padding * 2) / mathHeight;
@@ -1189,8 +1219,9 @@
       
       computeScale(minX, maxX, minY, maxY, true);
 
-      // Smart bounds expansion for point labels and custom text elements
+      // Smart bounds expansion for point labels and custom text elements (skip if forcedCrop is set)
       for (let pass = 0; pass < 3; pass++) {
+        if (config.forcedCrop) break;
         let expanded = false;
         let nextMinX = minX, nextMaxX = maxX, nextMinY = minY, nextMaxY = maxY;
         
