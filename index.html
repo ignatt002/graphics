@@ -68,8 +68,8 @@
  * - circle_circumscribed: true
  * - line[.color][.widthN][.marked]: X1;Y1 X2;Y2 [X3;Y3 ...]
  * - dashed_line[.color][.widthN][.marked]: X1;Y1 X2;Y2 [X3;Y3 ...]
- * - tick_mark NAME: X;Y
- * - tick_mark_horizontal NAME: X;Y
+ * - tick_mark[.color][.side] NAME: X;Y
+ * - tick_mark_horizontal[.color][.side] NAME: X;Y
  * - crop: X1;Y1 X2;Y2 (forced cropping box)
  */
 
@@ -667,18 +667,14 @@
             const match = line.match(/^point_filled\s+(.+)/i);
             if (match) config.filledPoints.push(match[1].trim());
         }
-        else if (lower.startsWith('tick_mark_horizontal ') || lower.startsWith('горизонтальная отметка ') || lower.startsWith('tick_mark ') || lower.startsWith('отметка ')) {
-            const match = line.match(/^(tick_mark_horizontal|горизонтальная\s+отметка|tick_mark|отметка)\s+(.+?)\s*:\s*(-?[\d.,]+)(?:\s*[;:]\s*(-?[\d.,]+))?\s*$/i);
+        else if (/^(?:tick_mark_horizontal|горизонтальная\s+отметка|tick_mark|отметка)[.\s]/i.test(line)) {
+            const match = line.match(/^(tick_mark_horizontal|горизонтальная\s+отметка|tick_mark|отметка)(?:\.([^\s:]+))?\s+(.+?)\s*:\s*(-?[\d.,]+)(?:\s*[;:]\s*(-?[\d.,]+))?\s*$/i);
             if (match) {
                 const isHoriz = /^(?:tick_mark_horizontal|горизонтальная)/i.test(match[1]);
-                let rawHeader = match[2].trim();
-                let name = rawHeader;
-                let modStr = '';
-                const qMatch = rawHeader.match(/^"([^"]*)"(.*)$/) || rawHeader.match(/^«([^»]*)»(.*)$/);
-                if (qMatch) {
-                    name = qMatch[1];
-                    modStr = qMatch[2].trim();
-                }
+                const modStr = match[2] ? match[2].trim() : '';
+                let name = match[3].trim();
+                const qWrap = name.match(/^"([^"]*)"$/) || name.match(/^«([^»]*)»$/);
+                if (qWrap) name = qWrap[1];
 
                 let color = null;
                 let side = null;
@@ -704,12 +700,12 @@
 
                 let x, y;
                 if (isHoriz) {
-                    const hasSecond = match[4] !== undefined;
-                    x = hasSecond ? parseFloat(match[3].replace(',', '.')) : 0;
-                    y = hasSecond ? parseFloat(match[4].replace(',', '.')) : parseFloat(match[3].replace(',', '.'));
+                    const hasSecond = match[5] !== undefined;
+                    x = hasSecond ? parseFloat(match[4].replace(',', '.')) : 0;
+                    y = hasSecond ? parseFloat(match[5].replace(',', '.')) : parseFloat(match[4].replace(',', '.'));
                 } else {
-                    x = parseFloat(match[3].replace(',', '.'));
-                    y = match[4] !== undefined ? parseFloat(match[4].replace(',', '.')) : 0;
+                    x = parseFloat(match[4].replace(',', '.'));
+                    y = match[5] !== undefined ? parseFloat(match[5].replace(',', '.')) : 0;
                 }
 
                 if (!isNaN(x) && !isNaN(y)) {
@@ -2459,4 +2455,4 @@ window.addEventListener('message', function(event) {
 });
     </script>
 </body>
-    </html>
+</html>
