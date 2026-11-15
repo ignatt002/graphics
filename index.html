@@ -667,30 +667,54 @@
             const match = line.match(/^point_filled\s+(.+)/i);
             if (match) config.filledPoints.push(match[1].trim());
         }
-        else if (lower.startsWith('tick_mark_horizontal ') || lower.startsWith('горизонтальная отметка ')) {
-            const match = line.match(/^(?:tick_mark_horizontal|горизонтальная\s+отметка)\s+([^:]+):\s*(-?[\d.,]+)(?:\s*[;:]\s*(-?[\d.,]+))?/i);
+        else if (lower.startsWith('tick_mark_horizontal ') || lower.startsWith('горизонтальная отметка ') || lower.startsWith('tick_mark ') || lower.startsWith('отметка ')) {
+            const match = line.match(/^(tick_mark_horizontal|горизонтальная\s+отметка|tick_mark|отметка)\s+(.+?)\s*:\s*(-?[\d.,]+)(?:\s*[;:]\s*(-?[\d.,]+))?\s*$/i);
             if (match) {
-                const name = match[1].trim();
-                const hasSecond = match[3] !== undefined;
-                const x = hasSecond ? parseFloat(match[2].replace(',', '.')) : 0;
-                const y = hasSecond ? parseFloat(match[3].replace(',', '.')) : parseFloat(match[2].replace(',', '.'));
-                if (!isNaN(x) && !isNaN(y)) {
-                    config.tickMarks.push({ name, x, y, horizontal: true });
-                    if (!config.pointByName[name]) {
-                        config.pointByName[name] = { x, y, name };
-                    }
+                const isHoriz = /^(?:tick_mark_horizontal|горизонтальная)/i.test(match[1]);
+                let rawHeader = match[2].trim();
+                let name = rawHeader;
+                let modStr = '';
+                const qMatch = rawHeader.match(/^"([^"]*)"(.*)$/) || rawHeader.match(/^«([^»]*)»(.*)$/);
+                if (qMatch) {
+                    name = qMatch[1];
+                    modStr = qMatch[2].trim();
                 }
-            }
-        }
-        else if (lower.startsWith('tick_mark ') || lower.startsWith('отметка ')) {
-            const match = line.match(/^(?:tick_mark|отметка)\s+([^:]+):\s*(-?[\d.,]+)(?:\s*[;:]\s*(-?[\d.,]+))?/i);
-            if (match) {
-                const name = match[1].trim();
-                const x = parseFloat(match[2].replace(',', '.'));
-                const y = match[3] !== undefined ? parseFloat(match[3].replace(',', '.')) : 0;
+
+                let color = null;
+                let side = null;
+                if (modStr) {
+                    const colorMap = {
+                        'ж': '#facc15', 'y': '#facc15', 'желтый': '#facc15', 'жёлтый': '#facc15', 'yellow': '#facc15',
+                        'к': '#fb7185', 'r': '#fb7185', 'красный': '#fb7185', 'red': '#fb7185',
+                        'з': '#4ade80', 'g': '#4ade80', 'зеленый': '#4ade80', 'зелёный': '#4ade80', 'green': '#4ade80',
+                        'с': '#60a5fa', 'b': '#60a5fa', 'синий': '#60a5fa', 'blue': '#60a5fa',
+                        'г': '#38bdf8', 'c': '#38bdf8', 'голубой': '#38bdf8', 'cyan': '#38bdf8',
+                        'сер': '#AFAFAF', 'серый': '#AFAFAF', 'gray': '#AFAFAF', 'grey': '#AFAFAF'
+                    };
+                    modStr.split(/[.\s]+/).map(t => t.trim()).filter(Boolean).forEach(tok => {
+                        const t = tok.toLowerCase();
+                        if (t === 'лево' || t === 'слева' || t === 'left') side = 'left';
+                        else if (t === 'право' || t === 'справа' || t === 'right') side = 'right';
+                        else if (t === 'верх' || t === 'сверху' || t === 'top') side = 'top';
+                        else if (t === 'низ' || t === 'снизу' || t === 'bottom') side = 'bottom';
+                        else if (colorMap[t]) color = colorMap[t];
+                        else if (/^#[0-9a-f]{3,8}$/i.test(t)) color = t;
+                    });
+                }
+
+                let x, y;
+                if (isHoriz) {
+                    const hasSecond = match[4] !== undefined;
+                    x = hasSecond ? parseFloat(match[3].replace(',', '.')) : 0;
+                    y = hasSecond ? parseFloat(match[4].replace(',', '.')) : parseFloat(match[3].replace(',', '.'));
+                } else {
+                    x = parseFloat(match[3].replace(',', '.'));
+                    y = match[4] !== undefined ? parseFloat(match[4].replace(',', '.')) : 0;
+                }
+
                 if (!isNaN(x) && !isNaN(y)) {
-                    config.tickMarks.push({ name, x, y, horizontal: false });
-                    if (!config.pointByName[name]) {
+                    config.tickMarks.push({ name, x, y, horizontal: isHoriz, color, side });
+                    if (name && !config.pointByName[name]) {
                         config.pointByName[name] = { x, y, name };
                     }
                 }
@@ -1283,9 +1307,16 @@
               const px = offsetX + (t.x - minX) * scale;
               const py = offsetY + (maxY - t.y) * scale;
               const labelLen = t.name ? String(t.name).replace(/\$[^$]*\$/g, 'xx').length : 1;
-              if (t.horizontal) {
+              const effectiveSide = t.side || (t.horizontal ? 'left' : 'bottom');
+              if (effectiveSide === 'left') {
                  const neededLeft = 18 + labelLen * 8;
                  if (px < neededLeft) { nextMinX -= (neededLeft - px) / scale; expanded = true; }
+              } else if (effectiveSide === 'right') {
+                 const neededRight = 18 + labelLen * 8;
+                 if (px > W - neededRight) { nextMaxX += (px - (W - neededRight)) / scale; expanded = true; }
+              } else if (effectiveSide === 'top') {
+                 const neededTop = 32;
+                 if (py < neededTop) { nextMaxY += (neededTop - py) / scale; expanded = true; }
               } else {
                  const neededBottom = 32;
                  if (py > H - neededBottom) { nextMinY -= (py - (H - neededBottom)) / scale; expanded = true; }
@@ -1448,12 +1479,22 @@
          config.tickMarks.forEach(t => {
            const px = mapX(t.x);
            const py = mapY(t.y);
+           const tickColor = t.color || THEME.axis;
            if (t.horizontal) {
-             svgElements += linePx(px - 6, py, px + 6, py, THEME.axis, 2);
-             svgElements += mathNodePx(px - 12, py, t.name, 'end', 'middle', THEME.axis, '12px');
+             svgElements += linePx(px - 6, py, px + 6, py, tickColor, 2);
            } else {
-             svgElements += linePx(px, py - 6, px, py + 6, THEME.axis, 2);
-             svgElements += mathNodePx(px, py + 12, t.name, 'middle', 'top', THEME.axis, '12px');
+             svgElements += linePx(px, py - 6, px, py + 6, tickColor, 2);
+           }
+
+           const side = t.side || (t.horizontal ? 'left' : 'bottom');
+           if (side === 'left') {
+             svgElements += mathNodePx(px - 12, py, t.name, 'end', 'middle', tickColor, '12px');
+           } else if (side === 'right') {
+             svgElements += mathNodePx(px + 12, py, t.name, 'start', 'middle', tickColor, '12px');
+           } else if (side === 'top') {
+             svgElements += mathNodePx(px, py - 12, t.name, 'middle', 'bottom', tickColor, '12px');
+           } else {
+             svgElements += mathNodePx(px, py + 12, t.name, 'middle', 'top', tickColor, '12px');
            }
          });
       } else if (config.equations && config.equations.length > 0 && !config.hideTicks) {
@@ -2098,8 +2139,13 @@
       });
       
       config.tickMarks.forEach(t => {
-         if (t.horizontal) {
+         const side = t.side || (t.horizontal ? 'left' : 'bottom');
+         if (side === 'left') {
             obstacles.push({type:'box', x: mapX(t.x) - 18, y: mapY(t.y), w: 24, h: 20});
+         } else if (side === 'right') {
+            obstacles.push({type:'box', x: mapX(t.x) + 18, y: mapY(t.y), w: 24, h: 20});
+         } else if (side === 'top') {
+            obstacles.push({type:'box', x: mapX(t.x), y: mapY(t.y) - 16, w: 20, h: 20});
          } else {
             obstacles.push({type:'box', x: mapX(t.x), y: mapY(t.y) + 16, w: 20, h: 20});
          }
@@ -2413,4 +2459,4 @@ window.addEventListener('message', function(event) {
 });
     </script>
 </body>
-</html>
+    </html>
