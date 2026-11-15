@@ -66,8 +66,10 @@
  * - chord DEG1: DEG2
  * - circle_inscribed: true
  * - circle_circumscribed: true
- * - line[.color]: X1;Y1 X2;Y2 [X3;Y3 ...]
- * - dashed_line[.color]: X1;Y1 X2;Y2 [X3;Y3 ...]
+ * - line[.color][.widthN][.marked]: X1;Y1 X2;Y2 [X3;Y3 ...]
+ * - dashed_line[.color][.widthN][.marked]: X1;Y1 X2;Y2 [X3;Y3 ...]
+ * - tick_mark NAME: X;Y
+ * - tick_mark_horizontal NAME: X;Y
  * - crop: X1;Y1 X2;Y2 (forced cropping box)
  */
 
@@ -206,12 +208,12 @@
 
       function parseFreeLine(line) {
         if (!line) return null;
-        const m = line.match(/^[\s]*(линия|line|polyline|пунктир|dashed_line|dash_line|dotted_line)(?:\.([A-Za-zА-Яа-яЁё0-9#]+))?\s*:\s*(.+)$/i);
+        const m = line.match(/^[\s]*(линия|line|polyline|пунктир|dashed_line|dash_line|dotted_line)(?:\.([^:]+))?\s*:\s*(.+)$/i);
         if (!m) return null;
 
         const cmdType = m[1].toLowerCase();
         const isDashed = cmdType === 'пунктир' || cmdType === 'dashed_line' || cmdType === 'dash_line' || cmdType === 'dotted_line';
-        const colorToken = m[2] ? m[2].toLowerCase() : null;
+        let modStr = m[2] ? m[2].trim() : '';
         const coordsStr = m[3].trim();
 
         const points = [];
@@ -237,9 +239,30 @@
         };
 
         let color = null;
-        if (colorToken) {
-          if (colorMap[colorToken]) color = colorMap[colorToken];
-          else if (/^#[0-9a-f]{3,8}$/i.test(colorToken)) color = colorToken;
+        let colorToken = null;
+        let customWidth = null;
+        let marked = false;
+
+        if (modStr) {
+          modStr = modStr.replace(/(?:^|[.\s])(?:толщина|width|w)\s*(\d+(?:[.,]\d+)?)(?=$|[.\s])/gi, (_, num) => {
+            const parsedW = parseFloat(num.replace(',', '.'));
+            if (!isNaN(parsedW) && parsedW > 0) customWidth = parsedW;
+            return ' ';
+          });
+
+          const tokens = modStr.split(/[.\s]+/).map(t => t.trim()).filter(Boolean);
+          tokens.forEach(tok => {
+            const t = tok.toLowerCase();
+            if (t === 'маркированная' || t === 'маркированный' || t === 'маркирован' || t === 'marked') {
+              marked = true;
+            } else if (colorMap[t]) {
+              color = colorMap[t];
+              colorToken = t;
+            } else if (/^#[0-9a-f]{3,8}$/i.test(t)) {
+              color = t;
+              colorToken = t;
+            }
+          });
         }
 
         if (!color) {
@@ -251,8 +274,9 @@
           dashed: isDashed,
           color,
           colorCode: colorToken,
-          strokeWidth: isDashed ? 2 : 3,
-          dashArray: isDashed ? '5,5' : ''
+          strokeWidth: customWidth !== null ? customWidth : (isDashed ? 2 : 3),
+          dashArray: isDashed ? '5,5' : '',
+          marked
         };
       }
 
@@ -643,15 +667,32 @@
             const match = line.match(/^point_filled\s+(.+)/i);
             if (match) config.filledPoints.push(match[1].trim());
         }
-        else if (lower.startsWith('tick_mark ')) {
-            const match = line.match(/^tick_mark\s+([^:]+):\s*(-?[\d.]+)[;:,]\s*(-?[\d.]+)/i);
+        else if (lower.startsWith('tick_mark_horizontal ') || lower.startsWith('горизонтальная отметка ')) {
+            const match = line.match(/^(?:tick_mark_horizontal|горизонтальная\s+отметка)\s+([^:]+):\s*(-?[\d.,]+)(?:\s*[;:]\s*(-?[\d.,]+))?/i);
             if (match) {
                 const name = match[1].trim();
-                const x = parseFloat(match[2]);
-                const y = parseFloat(match[3]);
-                config.tickMarks.push({ name, x, y });
-                if (!config.pointByName[name]) {
-                    config.pointByName[name] = { x, y, name };
+                const hasSecond = match[3] !== undefined;
+                const x = hasSecond ? parseFloat(match[2].replace(',', '.')) : 0;
+                const y = hasSecond ? parseFloat(match[3].replace(',', '.')) : parseFloat(match[2].replace(',', '.'));
+                if (!isNaN(x) && !isNaN(y)) {
+                    config.tickMarks.push({ name, x, y, horizontal: true });
+                    if (!config.pointByName[name]) {
+                        config.pointByName[name] = { x, y, name };
+                    }
+                }
+            }
+        }
+        else if (lower.startsWith('tick_mark ') || lower.startsWith('отметка ')) {
+            const match = line.match(/^(?:tick_mark|отметка)\s+([^:]+):\s*(-?[\d.,]+)(?:\s*[;:]\s*(-?[\d.,]+))?/i);
+            if (match) {
+                const name = match[1].trim();
+                const x = parseFloat(match[2].replace(',', '.'));
+                const y = match[3] !== undefined ? parseFloat(match[3].replace(',', '.')) : 0;
+                if (!isNaN(x) && !isNaN(y)) {
+                    config.tickMarks.push({ name, x, y, horizontal: false });
+                    if (!config.pointByName[name]) {
+                        config.pointByName[name] = { x, y, name };
+                    }
                 }
             }
         }
@@ -1237,6 +1278,21 @@
             }
         });
 
+        if (config.tickMarks && config.tickMarks.length > 0 && !config.hideTicks) {
+           config.tickMarks.forEach(t => {
+              const px = offsetX + (t.x - minX) * scale;
+              const py = offsetY + (maxY - t.y) * scale;
+              const labelLen = t.name ? String(t.name).replace(/\$[^$]*\$/g, 'xx').length : 1;
+              if (t.horizontal) {
+                 const neededLeft = 18 + labelLen * 8;
+                 if (px < neededLeft) { nextMinX -= (neededLeft - px) / scale; expanded = true; }
+              } else {
+                 const neededBottom = 32;
+                 if (py > H - neededBottom) { nextMinY -= (py - (H - neededBottom)) / scale; expanded = true; }
+              }
+           });
+        }
+
         // Ensure comfortable margin on sides where custom text is located
         if (config.texts && config.texts.length > 0) {
            const padSide = 40; // Indent / margin from the edges of the composition
@@ -1392,8 +1448,13 @@
          config.tickMarks.forEach(t => {
            const px = mapX(t.x);
            const py = mapY(t.y);
-           svgElements += linePx(px, py - 6, px, py + 6, THEME.axis, 2);
-           svgElements += mathNodePx(px, py + 12, t.name, 'middle', 'top', THEME.axis, '12px');
+           if (t.horizontal) {
+             svgElements += linePx(px - 6, py, px + 6, py, THEME.axis, 2);
+             svgElements += mathNodePx(px - 12, py, t.name, 'end', 'middle', THEME.axis, '12px');
+           } else {
+             svgElements += linePx(px, py - 6, px, py + 6, THEME.axis, 2);
+             svgElements += mathNodePx(px, py + 12, t.name, 'middle', 'top', THEME.axis, '12px');
+           }
          });
       } else if (config.equations && config.equations.length > 0 && !config.hideTicks) {
          // Автоматические числовые отметки для режима ГРАФИКОВ
@@ -1609,6 +1670,20 @@
             'stroke-linecap': 'round',
             'stroke-linejoin': 'round'
           });
+
+          if (fl.marked) {
+            const ptRadius = Math.max(6, Math.round(strokeWidth * 1.5));
+            fl.points.forEach(pt => {
+              svgElements += tag('circle', {
+                cx: mapX(pt.x).toFixed(1),
+                cy: mapY(pt.y).toFixed(1),
+                r: ptRadius,
+                fill: strokeColor,
+                stroke: 'none',
+                'stroke-width': 0
+              });
+            });
+          }
         });
       }
 
@@ -1998,6 +2073,12 @@
                   y2: mapY(fl.points[i + 1].y)
                });
             }
+            if (fl.marked) {
+               const ptSize = Math.max(14, (fl.strokeWidth || 3) * 3 + 2);
+               fl.points.forEach(pt => {
+                  obstacles.push({ type: 'box', x: mapX(pt.x), y: mapY(pt.y), w: ptSize, h: ptSize });
+               });
+            }
          });
       }
 
@@ -2017,7 +2098,11 @@
       });
       
       config.tickMarks.forEach(t => {
-         obstacles.push({type:'box', x: mapX(t.x), y: mapY(t.y) + 16, w: 20, h: 20});
+         if (t.horizontal) {
+            obstacles.push({type:'box', x: mapX(t.x) - 18, y: mapY(t.y), w: 24, h: 20});
+         } else {
+            obstacles.push({type:'box', x: mapX(t.x), y: mapY(t.y) + 16, w: 20, h: 20});
+         }
       });
 
       if (config.texts && config.texts.length > 0) {
