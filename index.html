@@ -1688,7 +1688,7 @@
           });
 
           if (fl.marked) {
-            const ptRadius = Math.max(6, Math.round(strokeWidth * 1.5));
+            const ptRadius = Math.max(1.5, +(strokeWidth * 2).toFixed(1));
             fl.points.forEach(pt => {
               svgElements += tag('circle', {
                 cx: mapX(pt.x).toFixed(1),
@@ -2106,7 +2106,9 @@
                });
             }
             if (fl.marked) {
-               const ptSize = Math.max(14, (fl.strokeWidth || 3) * 3 + 2);
+               const sw = fl.strokeWidth || (fl.dashed ? 2 : 3);
+               const ptRadius = Math.max(1.5, +(sw * 2).toFixed(1));
+               const ptSize = Math.max(6, Math.ceil(ptRadius * 2 + 2));
                fl.points.forEach(pt => {
                   obstacles.push({ type: 'box', x: mapX(pt.x), y: mapY(pt.y), w: ptSize, h: ptSize });
                });
