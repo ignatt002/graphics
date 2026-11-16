@@ -258,8 +258,8 @@
             } else if (colorMap[t]) {
               color = colorMap[t];
               colorToken = t;
-            } else if (/^#[0-9a-f]{3,8}$/i.test(t)) {
-              color = t;
+            } else if (/^#?(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(t)) {
+              color = t.startsWith('#') ? t : '#' + t;
               colorToken = t;
             }
           });
@@ -289,12 +289,12 @@
 
         let rest = header.replace(/^[\s]*(?:текст|text)\.?/i, '').trim();
 
-        const coordMatch = rest.match(/(-?\d+(?:[.,]\d+)?)\s*;\s*(-?\d+(?:[.,]\d+)?)/);
+        const coordMatch = rest.match(/(?:^|[.\s])(-?\d+(?:[.,]\d+)?)\s*;\s*(-?\d+(?:[.,]\d+)?)(?=$|[.\s])/);
         if (!coordMatch) return null;
 
         const x = parseFloat(coordMatch[1].replace(',', '.'));
         const y = parseFloat(coordMatch[2].replace(',', '.'));
-        rest = rest.replace(coordMatch[0], '');
+        rest = rest.replace(coordMatch[0], ' ');
 
         const tokens = rest.split(/[.\s]+/).map(t => t.trim()).filter(Boolean);
 
@@ -342,8 +342,9 @@
             colorCode = t;
             return;
           }
-          if (/^#[0-9a-f]{3,8}$/i.test(t)) {
-            color = t;
+          if (/^#?(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(t)) {
+            color = t.startsWith('#') ? t : '#' + t;
+            colorCode = t;
             return;
           }
         });
@@ -557,7 +558,7 @@
         }
         else if (lower.startsWith('angle_inner ') || lower.startsWith('angle_outer ')) {
             const isInner = lower.startsWith('angle_inner');
-            const match = line.match(/^angle_(?:inner|outer)\s+([A-Z]{3})(?:\s+([a-zа-яё]))?:\s*(.*)/i);
+            const match = line.match(/^angle_(?:inner|outer)\s+([A-Z]{3})(?:\s+([a-zа-яё0-9#]+))?:\s*(.*)/i);
             if (match) {
                config.angles.push({ 
                  name: match[1].trim(), 
@@ -694,7 +695,7 @@
                         else if (t === 'верх' || t === 'сверху' || t === 'top') side = 'top';
                         else if (t === 'низ' || t === 'снизу' || t === 'bottom') side = 'bottom';
                         else if (colorMap[t]) color = colorMap[t];
-                        else if (/^#[0-9a-f]{3,8}$/i.test(t)) color = t;
+                        else if (/^#?(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(t)) color = t.startsWith('#') ? t : '#' + t;
                     });
                 }
 
@@ -1470,30 +1471,8 @@
         svgElements += mathNodePx(pxZ + 14, pyT + 12, '$y$', 'middle', 'middle', THEME.axisText);
       }
 
-      // --- TICK MARKS (КООРДИНАТНАЯ ПРЯМАЯ ИЛИ АВТО-ОТМЕТКИ Осей) ---
-      if (config.tickMarks.length > 0 && !config.hideTicks) {
-         config.tickMarks.forEach(t => {
-           const px = mapX(t.x);
-           const py = mapY(t.y);
-           const tickColor = t.color || THEME.axis;
-           if (t.horizontal) {
-             svgElements += linePx(px - 6, py, px + 6, py, tickColor, 2);
-           } else {
-             svgElements += linePx(px, py - 6, px, py + 6, tickColor, 2);
-           }
-
-           const side = t.side || (t.horizontal ? 'left' : 'bottom');
-           if (side === 'left') {
-             svgElements += mathNodePx(px - 12, py, t.name, 'end', 'middle', tickColor, '12px');
-           } else if (side === 'right') {
-             svgElements += mathNodePx(px + 12, py, t.name, 'start', 'middle', tickColor, '12px');
-           } else if (side === 'top') {
-             svgElements += mathNodePx(px, py - 12, t.name, 'middle', 'bottom', tickColor, '12px');
-           } else {
-             svgElements += mathNodePx(px, py + 12, t.name, 'middle', 'top', tickColor, '12px');
-           }
-         });
-      } else if (config.equations && config.equations.length > 0 && !config.hideTicks) {
+      // --- АВТО-ОТМЕТКИ ОСЕЙ ДЛЯ ГРАФИКОВ ---
+      if (config.tickMarks.length === 0 && config.equations && config.equations.length > 0 && !config.hideTicks) {
          // Автоматические числовые отметки для режима ГРАФИКОВ
          // Динамический расчет шага делений (интеллектуальное масштабирование), чтобы исключить наложение
          function findNiceStep(mathSpan, targetCount = 10) {
@@ -1968,10 +1947,26 @@
           const ang1 = Math.atan2(py1 - pyC, px1 - pxC);
           const ang2 = Math.atan2(py2 - pyC, px2 - pxC);
           
-          const colorsMapping = { 'ж': '#facc15', 'к': '#fb7185', 'з': '#4ade80', 'с': '#60a5fa', 'г': '#38bdf8' };
-          const strokeColor = ang.colorCode && colorsMapping[ang.colorCode] ? colorsMapping[ang.colorCode] : THEME.text;
-          const fillColor = ang.colorCode && colorsMapping[ang.colorCode] ? colorsMapping[ang.colorCode] : THEME.text;
-          const fillOpacity = ang.colorCode ? 0.35 : 0.05;
+          const colorsMapping = {
+            'ж': '#facc15', 'y': '#facc15',
+            'к': '#fb7185', 'r': '#fb7185',
+            'з': '#4ade80', 'g': '#4ade80',
+            'с': '#60a5fa', 'b': '#60a5fa',
+            'г': '#38bdf8', 'c': '#38bdf8',
+            'сер': '#AFAFAF', 'серый': '#AFAFAF', 'gray': '#AFAFAF', 'grey': '#AFAFAF'
+          };
+          let resolvedAngleColor = null;
+          if (ang.colorCode) {
+            const cKey = ang.colorCode.toLowerCase();
+            if (colorsMapping[cKey]) {
+              resolvedAngleColor = colorsMapping[cKey];
+            } else if (/^#?(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(cKey)) {
+              resolvedAngleColor = cKey.startsWith('#') ? cKey : '#' + cKey;
+            }
+          }
+          const strokeColor = resolvedAngleColor || THEME.text;
+          const fillColor = resolvedAngleColor || THEME.text;
+          const fillOpacity = resolvedAngleColor ? 0.35 : 0.05;
 
           const dist1 = Math.hypot(px1 - pxC, py1 - pyC);
           const dist2 = Math.hypot(px2 - pxC, py2 - pyC);
@@ -2284,6 +2279,31 @@
            return mathNodePx(finalCx, finalCy, str, 'middle', 'middle', THEME.text);
       }
 
+      // --- ОТМЕТКИ (поверх линий) ---
+      if (config.tickMarks.length > 0 && !config.hideTicks) {
+         config.tickMarks.forEach(t => {
+           const px = mapX(t.x);
+           const py = mapY(t.y);
+           const tickColor = t.color || THEME.axis;
+           if (t.horizontal) {
+             svgElements += linePx(px - 6, py, px + 6, py, tickColor, 2);
+           } else {
+             svgElements += linePx(px, py - 6, px, py + 6, tickColor, 2);
+           }
+
+           const side = t.side || (t.horizontal ? 'left' : 'bottom');
+           if (side === 'left') {
+             svgElements += mathNodePx(px - 12, py, t.name, 'end', 'middle', tickColor, '12px');
+           } else if (side === 'right') {
+             svgElements += mathNodePx(px + 12, py, t.name, 'start', 'middle', tickColor, '12px');
+           } else if (side === 'top') {
+             svgElements += mathNodePx(px, py - 12, t.name, 'middle', 'bottom', tickColor, '12px');
+           } else {
+             svgElements += mathNodePx(px, py + 12, t.name, 'middle', 'top', tickColor, '12px');
+           }
+         });
+      }
+
       config.allPoints.forEach(p => {
         if (config.pointsInvisibleAll) return;
         if (config.invisiblePoints && config.invisiblePoints.includes(p.name)) return;
@@ -2315,7 +2335,7 @@
           'с': '#60a5fa', 'b': '#60a5fa',
           'сер': '#AFAFAF', 'серый': '#AFAFAF', 'gray': '#AFAFAF', 'grey': '#AFAFAF'
         };
-        const inlineColorRegex = /\\{2}(серый|сер|gray|grey|[гжкзсycrgb])\s*([\s\S]+?)\s*\\{2}(?:\1|(?=[^a-zа-яё]|$))/gi;
+        const inlineColorRegex = /\\{2}(#?(?:[0-9a-f]{8}|[0-9a-f]{6}|[0-9a-f]{4}|[0-9a-f]{3})(?=\s|[^a-z0-9]|$)|серый|сер|gray|grey|[гжкзсycrgb])\s*([\s\S]+?)\s*\\{2}(?:\1|(?=[^a-zа-яё0-9]|$))/gi;
 
         config.texts.forEach(item => {
           const px = mapX(item.x);
@@ -2326,7 +2346,7 @@
 
           let rawText = item.text || '';
           const hasKatex = typeof window !== 'undefined' && window.katex && rawText.includes('$');
-          const hasInlineColor = /\\{2}(серый|сер|gray|grey|[гжкзсycrgb])\s*[\s\S]+?\s*\\{2}(?:\1|(?=[^a-zа-яё]|$))/i.test(rawText);
+          const hasInlineColor = /\\{2}(#?(?:[0-9a-f]{8}|[0-9a-f]{6}|[0-9a-f]{4}|[0-9a-f]{3})(?=\s|[^a-z0-9]|$)|серый|сер|gray|grey|[гжкзсycrgb])\s*[\s\S]+?\s*\\{2}(?:\1|(?=[^a-zа-яё0-9]|$))/i.test(rawText);
 
           let renderedHtml = rawText;
           if (hasKatex) {
@@ -2346,13 +2366,17 @@
 
           if (hasInlineColor) {
             renderedHtml = renderedHtml.replace(inlineColorRegex, (match, tag, inner) => {
-              const hCol = INLINE_COLOR_MAP[tag.toLowerCase()] || '#AFAFAF';
-              return `<span style="color:${hCol};">${inner}</span>`;
+              const rawTag = tag.toLowerCase();
+              let hCol = INLINE_COLOR_MAP[rawTag];
+              if (!hCol && /^#?(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(rawTag)) {
+                hCol = rawTag.startsWith('#') ? rawTag : '#' + rawTag;
+              }
+              return `<span style="color:${hCol || '#AFAFAF'};">${inner}</span>`;
             });
           }
 
           const cleanTextForLength = rawText
-            .replace(/\\{2}(серый|сер|gray|grey|[гжкзсycrgb])\s*/gi, '')
+            .replace(/\\{2}(?:#?(?:[0-9a-f]{8}|[0-9a-f]{6}|[0-9a-f]{4}|[0-9a-f]{3})(?=\s|[^a-z0-9]|$)|серый|сер|gray|grey|[гжкзсycrgb])\s*/gi, '')
             .replace(/\\{2}\s*/g, '');
 
           if (item.fieldWidth != null || hasKatex || hasInlineColor || rawText.includes('\n')) {
